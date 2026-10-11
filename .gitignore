@@ -1,0 +1,12 @@
+# Build output, packaging intermediates, and template cache.
+dist/
+build-tmp/
+build-cache/
+src/agent/embedded-config.json
+package.json.buildbak
+*.log
+
+# Dependencies and OS noise.
+node_modules/
+.DS_Store
+Thumbs.db
