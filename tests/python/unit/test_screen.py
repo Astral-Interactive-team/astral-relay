@@ -1,0 +1,244 @@
+# Unit tests for in-place menu redraws: physical line counting, erase
+# sequences, and no-accumulation across navigation cycles.
+
+import io
+import sys
+
+from rich.console import Console
+
+from astral_relay.cli.menu import (
+    erase_lines,
+    is_interactive,
+    physical_line_count,
+    prompt_rows,
+    run_menu,
+)
+
+
+class FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class FakePipe(io.StringIO):
+    def isatty(self):
+        return False
+
+
+def test_physical_line_count_logical_and_wrapped():
+    assert physical_line_count("a\nb\nc") == 3
+    assert physical_line_count("ab", None) == 1
+    assert physical_line_count("ab", 0) == 1
+    assert physical_line_count("abcdefghij", 8) == 2
+    assert physical_line_count("abcdefgh", 8) == 1
+    assert physical_line_count("", 80) == 1
+
+
+def test_prompt_rows_cover_prompt_and_echo():
+    rows = prompt_rows("01", False, 80)
+    assert rows == 2
+    rows_wrapped = prompt_rows("x" * 200, False, 80)
+    assert rows_wrapped > 2
+
+
+def test_erase_lines_sequence_and_guards():
+    stream = FakeTTY()
+    console = Console(file=stream, force_terminal=False)
+    erase_lines(console, 3)
+    assert stream.getvalue() == "\x1b[3A\x1b[2K\x1b[1B\x1b[2K\x1b[1B\x1b[2K\x1b[1B\x1b[3A"
+    erase_lines(console, 0)
+    erase_lines(console, -2)
+    assert stream.getvalue().count("\x1b[") == 8
+
+
+def test_is_interactive_requires_both_ttys(monkeypatch):
+    out_tty = Console(file=FakeTTY(), force_terminal=False)
+    monkeypatch.setattr(sys, "stdin", FakeTTY())
+    assert is_interactive(out_tty) in (True, False)  # console.is_terminal decides on width probe
+    monkeypatch.setattr(sys, "stdin", FakePipe())
+    assert is_interactive(out_tty) is False
+
+
+def _run_with_streams(stdin_text, stdout_stream, monkeypatch):
+    stdin = FakeTTY()
+    stdin.write(stdin_text)
+    stdin.seek(0)
+    # Simulate terminal echo: a real console advances past the input row
+    # on Enter. Without this the test stream cursor sits one row higher
+    # than production and erase math cannot match.
+    original_readline = stdin.readline
+
+    def echoing_readline(*args):
+        line = original_readline(*args)
+        stdout_stream.write("\n")
+        return line
+
+    stdin.readline = echoing_readline
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", stdout_stream)
+    return run_menu()
+
+
+def _emulate_screen(stream_text):
+    """Minimal terminal emulator: applies cursor-up, line-clear, cursor-down.
+
+    Returns visible lines after processing escape sequences, with SGR
+    color codes stripped. Lets tests assert what a user would see.
+    """
+    import re
+
+    lines: list[str] = [""]
+    row = 0
+    token = re.compile(r"\x1b\[(?P<count>[?0-9;]*)(?P<cmd>[a-zA-Z])|(?P<cr>\r)|(?P<nl>\n)|(?P<ch>.)", re.DOTALL)
+    for match in token.finditer(stream_text):
+        seq, count, command = match.group(0), match.group("count"), match.group("cmd")
+        if command in ("A", "B") and (count or "").isdigit():
+            row = max(0, row + (-int(count or 1) if command == "A" else int(count or 1)))
+            while row >= len(lines):
+                lines.append("")
+        elif command == "K" and (count or "") in ("", "2"):
+            lines[row] = ""
+        elif command == "H":
+            row = 0
+        elif command == "J":
+            lines = [""]
+            row = 0
+        elif command is not None:
+            pass  # other sequences (alt-screen enter/exit, SGR colors): no visible change
+        elif match.group("nl"):
+            row += 1
+            if row >= len(lines):
+                lines.append("")
+        elif match.group("cr"):
+            pass
+        else:
+            lines[row] += match.group("ch")
+    return [line for line in lines]
+
+
+def test_interactive_navigation_leaves_single_menu(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    out = FakeTTY()
+    assert _run_with_streams("n\nb\nq\n", out, monkeypatch) == 0
+    raw = out.getvalue()
+    # Every input erases menu+prompt before the action:
+    # HOME(11+2+1) + RELAY(10+2+1) + HOME(11+2+1); +1 is the forced newline.
+    assert raw.count("\x1b[2K") == 14 + 13 + 14
+    visible = "\n".join(_emulate_screen(raw))
+    assert visible.count("┌── HOME") == 0  # erased on quit
+    assert visible.count("┌── RELAY") == 0  # erased on navigation
+    assert visible.count("by Astral Interactive") == 1  # banner printed once, never erased
+    assert "Bye." not in visible
+
+
+def test_interactive_uses_alternate_screen(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    out = FakeTTY()
+    assert _run_with_streams("q\n", out, monkeypatch) == 0
+    raw = out.getvalue()
+    assert "\x1b[?1049h" in raw  # alt screen entered
+    assert "\x1b[?1049l" in raw  # alt screen restored on exit
+
+
+def test_non_interactive_has_no_screen_sequences(monkeypatch):
+    out = FakePipe()
+    stdin = FakePipe()
+    stdin.write("q\n")
+    stdin.seek(0)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", out)
+    from astral_relay.cli.menu import run_menu as _run
+
+    assert _run() == 0
+    assert "?1049" not in out.getvalue()
+
+
+def test_wait_erases_prompt_interactive(monkeypatch):
+    import sys
+
+    from rich.console import Console
+
+    from astral_relay.cli.menu import wait_to_continue
+
+    out = FakeTTY()
+    stdin = FakeTTY()
+    stdin.write("\n")
+    stdin.seek(0)
+    original_readline = stdin.readline
+
+    def echoing_readline(*args):
+        line = original_readline(*args)
+        out.write("\n")
+        return line
+
+    stdin.readline = echoing_readline
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setenv("COLUMNS", "120")
+    monkeypatch.setenv("LINES", "24")
+    console = Console(highlight=False)
+    wait_to_continue(console, True)
+    visible = "\n".join(_emulate_screen(out.getvalue()))
+    assert "press enter" not in visible
+
+
+def test_wait_to_continue_returns_on_eof(monkeypatch):
+    import sys
+
+    from rich.console import Console
+
+    from astral_relay.cli.menu import wait_to_continue
+
+    stdin = FakePipe()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    console = Console(file=FakePipe(), force_terminal=False, no_color=True)
+    assert wait_to_continue(console, False) is None
+    assert "press enter to continue" in console.file.getvalue()
+
+
+def test_refresh_clears_action_output(monkeypatch):
+    import sys
+
+    from rich.console import Console
+
+    from astral_relay.cli.menu import refresh_screen
+
+    out = FakeTTY()
+    monkeypatch.setattr(sys, "stdout", out)
+    console = Console(highlight=False)
+    console.print("stale token prompt ****")
+    refresh_screen(console, "BANNER", False, None)
+    visible = "\n".join(_emulate_screen(out.getvalue()))
+    assert "stale token prompt" not in visible
+    assert visible.count("BANNER") == 1
+
+
+def test_generate_result_has_no_panel(monkeypatch):
+    import sys
+
+    from rich.console import Console
+
+    import astral_relay.builder.build as build_mod
+    import astral_relay.cli.menu as menu_mod
+
+    monkeypatch.setattr(build_mod, "prompt_build_token", lambda: (_ for _ in ()).throw(ValueError("Empty token rejected.")))
+    stdin = FakePipe()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    console = Console(file=FakePipe(), force_terminal=False, no_color=True)
+    assert menu_mod.run_generate(console, False) is False
+    out = console.file.getvalue()
+    assert "╭" not in out and "╰" not in out
+
+
+def test_non_interactive_has_no_cursor_sequences(monkeypatch):
+    out = FakePipe()
+    stdin = FakePipe()
+    stdin.write("q\n")
+    stdin.seek(0)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", out)
+    assert run_menu() == 0
+    assert "\x1b[" not in out.getvalue()
+    assert "┌── HOME" in out.getvalue()

@@ -1,12 +1,13 @@
-# Build output, packaging intermediates, and template cache.
+# Build output and packaging intermediates.
 dist/
 build-tmp/
-build-cache/
-src/agent/embedded-config.json
-package.json.buildbak
 *.log
 
 # Dependencies and OS noise.
-node_modules/
+.venv/
+__pycache__/
+.pytest_cache/
+*.spec
+*.egg-info/
 .DS_Store
 Thumbs.db
