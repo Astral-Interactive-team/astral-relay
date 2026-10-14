@@ -100,11 +100,11 @@ def test_prompt_colored_contains_same_text():
 
 
 def test_load_banner_matches_file_bytes():
-    from pathlib import Path
-
-    raw = Path("banner.txt").read_text(encoding="utf-8")
-    assert views.load_banner_text() == raw
+    raw = views.load_banner_text()
+    assert raw == views.load_banner_text(views.BANNER_PATH)
     assert "discord.gg/bSvcQG8K4f" in raw
+    assert views.BANNER_PATH.name == "banner.txt"
+    assert views.BANNER_PATH.parent.name == "cli"
 
 
 def test_banner_full_url_preserved_narrow():

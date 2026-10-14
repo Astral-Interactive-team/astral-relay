@@ -80,10 +80,6 @@ def _stage_package() -> Path:
         "from astral_relay.agent.app import entry\n\nif __name__ == '__main__':\n    entry()\n",
         encoding="utf-8",
     )
-    # Copy top-level metadata the package needs at runtime.
-    banner = ROOT / "banner.txt"
-    if banner.is_file():
-        shutil.copy2(banner, stage / "pkg" / "banner.txt")
     return stage
 
 

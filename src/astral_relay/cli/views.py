@@ -21,7 +21,7 @@ from astral_relay.cli.theme import (
     style_text,
 )
 
-BANNER_PATH = Path(__file__).resolve().parent.parent.parent.parent / "banner.txt"
+BANNER_PATH = Path(__file__).resolve().parent / "banner.txt"
 
 
 def load_banner_text(path=None) -> str:
