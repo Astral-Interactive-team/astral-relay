@@ -2,10 +2,10 @@
 
 <p align="center">
   <a href="https://github.com/Astral-Interactive-team/astral-relay/archive/refs/heads/main.zip">
-    <img src="https://img.shields.io/badge/⬇_Download-Astral--Relay-8B5CF6?style=for-the-badge&logo=github&logoColor=white" alt="Download Astral Relay">
+    <img src="https://img.shields.io/badge/Download-Astral--Relay-8B5CF6?style=for-the-badge&logo=github&logoColor=white" alt="Download Astral Relay">
   </a>
   <a href="https://github.com/Astral-Interactive-team/astral-relay/stargazers">
-    <img src="https://img.shields.io/github/stars/Astral-Interactive-team/astral-relay?color=8B5CF6&style=for-the-badge&label=⭐_Star_Astral_Relay" alt="Star Astral Relay">
+    <img src="https://img.shields.io/github/stars/Astral-Interactive-team/astral-relay?color=8B5CF6&style=for-the-badge&label=Star_Astral_Relay" alt="Star Astral Relay">
   </a>
   <a href="https://github.com/Astral-Interactive-team/astral-relay">
     <img src="https://img.shields.io/badge/Repo-astral--relay-181717?style=for-the-badge&logo=github&logoColor=white" alt="Official Repository">
