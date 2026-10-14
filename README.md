@@ -1,74 +1,112 @@
-# Astral Relay
+# ASTRAL RELAY v0.1.0
 
-![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
-![Rich](https://img.shields.io/badge/Terminal_UI-Rich-8B5CF6?style=for-the-badge)
-![discord.py](https://img.shields.io/badge/discord.py-2.7.1-5865F2?style=for-the-badge&logo=discord&logoColor=white)
-![PyInstaller](https://img.shields.io/badge/PyInstaller-One--File-FE7D37?style=for-the-badge&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-139_Passed-2EA44F?style=for-the-badge&logo=pytest&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Experimental-orange?style=for-the-badge)
+<p align="center">
+  <a href="https://github.com/Astral-Interactive-team/astral-relay/archive/refs/heads/main.zip">
+    <img src="https://img.shields.io/badge/⬇_Download-Astral--Relay-8B5CF6?style=for-the-badge&logo=github&logoColor=white" alt="Download Astral Relay">
+  </a>
+  <a href="https://github.com/Astral-Interactive-team/astral-relay/stargazers">
+    <img src="https://img.shields.io/github/stars/Astral-Interactive-team/astral-relay?color=8B5CF6&style=for-the-badge&label=⭐_Star_Astral_Relay" alt="Star Astral Relay">
+  </a>
+  <a href="https://github.com/Astral-Interactive-team/astral-relay">
+    <img src="https://img.shields.io/badge/Official-Astral--Interactive%2Fastral--relay-181717?style=for-the-badge&logo=github&logoColor=white" alt="Official Repository">
+  </a>
+</p>
 
-**A Discord-controlled Windows remote management agent.**
-
-Astral Relay is a Python-based CLI application by **Astral Interactive** that builds a standalone Windows executable and connects it to Discord. It combines a terminal interface, Windows application discovery, permission-controlled commands, and single-file packaging.
-
-> [!WARNING]
-> Astral Relay is experimental. Live Discord integration and all target-PC operations have not yet been fully verified. The current build embeds the Discord bot token in the executable, where it can be extracted. Review the security considerations before running or distributing an Agent.
+<p align="center">
+  <b>A Discord-controlled Windows remote management agent.</b>
+  <br>
+  Developed by <b>Astral Interactive</b>.
+</p>
 
 ---
 
+> [!CAUTION]
+> **Experimental software.** Use only on computers you own or are explicitly authorized to administer.
+>
+> The current production build embeds the Discord bot token in the executable as recoverable data. Anyone who obtains the EXE may be able to extract the token. Do not distribute a token-bearing executable to untrusted recipients.
+
 ## Overview
 
-Astral Relay consists of two main components:
+**Astral Relay** is a Python-based CLI application that builds a standalone Windows executable and connects it directly to Discord.
 
-| Component | Description |
+It combines a custom Rich terminal interface, Windows application discovery, permission-controlled commands, and single-file executable packaging.
+
+No separate Astral Relay backend server is required.
+
+## Features
+
+### Terminal Interface
+
+Astral Relay provides a custom terminal interface with Astral Interactive branding.
+
+| Page | Features |
 |:--|:--|
-| **Astral Relay CLI** | Interactive terminal interface for building and launching the Agent |
-| **Astral Relay Agent** | Standalone Windows executable that connects to Discord and processes authorized commands |
+| HOME | GitHub, Telegram, Discord |
+| RELAY | Generate Agent EXE, Start Agent |
 
-The Agent communicates directly with Discord. No separate Astral Relay backend server is required.
+The startup banner is stored in `banner.txt`. The development CLI and production Agent use separate entry points.
 
-### Features
+### Discord Agent
 
-- **CLI-first workflow** — terminal interface powered by Rich.
-- **Standalone EXE** — package the Agent for Windows x64.
-- **Discord integration** — control supported operations through prefix commands.
-- **Application discovery** — search supported Windows Start Menu shortcuts.
-- **Permission-based access control** — check guild context and member permissions.
-- **Single-file packaging** — distribute the Agent as one executable.
-- **Diagnostic logging** — write sanitized fatal errors to a local log file.
+The Agent connects to Discord and processes supported prefix commands.
 
-## Terminal Interface
+| Command | Description |
+|:--|:--|
+| `!pc status` | Display basic Agent and system status |
+| `!pc apps` | List discovered applications |
+| `!pc apps <query>` | Search the application catalog |
+| `!pc open <id>` | Launch a discovered application |
+| `!pc lock` | Lock the current Windows session |
 
-Astral Relay uses a custom Kali-inspired terminal layout with Astral Interactive branding.
+Commands are case-insensitive. For example, `!PC STATUS` is equivalent to `!pc status`.
 
-**HOME**
-- GitHub
-- Telegram
-- Discord
+### Windows Application Discovery
 
-**RELAY**
-- Generate Agent EXE
-- Start Agent
+Astral Relay discovers supported applications through Windows Start Menu shortcuts.
 
-The startup banner is stored in `banner.txt`. The interactive development CLI and production Agent have separate entry points.
+The application catalog is generated locally. `/pc open` is not used; the Python Agent uses the `!pc open <id>` prefix command and validates the selected application before launching it.
+
+Unsupported shortcut types and unresolved executable targets are handled conservatively.
+
+### Executable Builder
+
+Astral Relay packages its Agent using PyInstaller.
+
+The build pipeline validates the configuration, prepares an isolated staging directory, packages the application, verifies the executable, and publishes the result only after validation succeeds.
+
+Generated executable:
+
+```text
+dist/
+└── AstralRelay-Agent.exe
+```
+
+If the build fails verification, the previous executable is preserved.
 
 ## Requirements
 
-- Windows x64
-- Python 3.14
-- A Discord application and bot account
-- A Discord server you own or are authorized to administer
+| Dependency | Version |
+|:--|:--|
+| Python | 3.14 |
+| Rich | 15.0.0 |
+| discord.py | 2.7.1 |
+| PyInstaller | 6.15.0 |
+| pytest | 8.3.4 |
 
-## Quick Start
+A Discord application and bot account are required for live Discord testing.
 
-### 1. Open the repository
+## Installation
+
+### 1. Clone the repository
 
 ```powershell
-cd C:\Users\User\Desktop\astral-relay
+git clone https://github.com/Astral-Interactive-team/astral-relay.git
+cd astral-relay
 ```
 
-### 2. Create and activate a virtual environment
+Alternatively, download and extract the source ZIP from the download link above.
+
+### 2. Create a virtual environment
 
 ```powershell
 py -3.14 -m venv .venv
@@ -82,9 +120,9 @@ python -m pip install -r requirements.lock
 python -m pip install --no-deps -e .
 ```
 
-The editable installation makes the `src/astral_relay` package importable in the current environment.
+The editable installation makes the `src/astral_relay` package importable from the active environment.
 
-### 4. Start Astral Relay
+### 4. Launch Astral Relay
 
 ```powershell
 python -m astral_relay
@@ -92,20 +130,39 @@ python -m astral_relay
 
 No global installation or PATH modification is required.
 
-## CLI Commands
+## Usage
 
-| Command | Description |
+Launch the interactive CLI:
+
+```powershell
+python -m astral_relay
+```
+
+Available menu actions:
+
+| Option | Action |
 |:--|:--|
-| `python -m astral_relay` | Open the interactive terminal menu |
-| `python -m astral_relay --version` | Display the application version |
-| `python -m astral_relay build` | Run the executable build workflow |
-| `python scripts/build_exe.py` | Invoke the standalone packaging script |
+| `01` | Generate Agent EXE |
+| `02` | Start Agent |
+| `N` | Open the RELAY page |
+| `B` | Return to HOME |
+| `Q` | Exit |
 
-The recommended development workflow is to launch the CLI and select **Generate Agent EXE** from the menu.
+Display the version:
+
+```powershell
+python -m astral_relay --version
+```
+
+To invoke the standalone build script directly:
+
+```powershell
+python scripts/build_exe.py
+```
+
+The recommended workflow is to generate the Agent through the interactive menu.
 
 ## Build Pipeline
-
-Astral Relay uses PyInstaller to package the Python Agent.
 
 The build process performs four stages:
 
@@ -114,7 +171,7 @@ The build process performs four stages:
 3. **Packaging** — generate a Windows x64 executable using PyInstaller.
 4. **Verification** — validate the output, executable subsystem, version command, and self-test result before publication.
 
-Output:
+The final output is:
 
 ```text
 dist/
@@ -123,72 +180,59 @@ dist/
 
 The builder publishes the new executable only after verification succeeds and preserves the previous output when a build fails.
 
-Each token-specific executable currently requires a full PyInstaller rebuild, which can take several minutes.
+Each token-specific build currently requires a full PyInstaller rebuild, which can take several minutes.
 
-## Discord Commands
+## Discord Setup
 
-The Python Agent uses prefix commands rather than slash commands.
+The Python Agent uses **prefix commands**, not slash commands.
 
-| Command | Description |
-|:--|:--|
-| `!pc status` | Display basic Agent and system status |
-| `!pc apps` | List discovered applications |
-| `!pc apps <query>` | Search the application catalog |
-| `!pc open <id>` | Launch a discovered application by its identifier |
-| `!pc lock` | Lock the current Windows session |
+The bot requires the **Message Content Intent** to process messages beginning with `!pc`.
 
-Commands are case-insensitive. For example, `!PC STATUS` and `!pc status` are equivalent.
+Enable the intent in both:
 
-The Agent requires guild context and the configured management permission. Direct messages are rejected, and members without sufficient permissions cannot execute Windows operations.
+1. The Agent's Discord intent configuration.
+2. Discord Developer Portal → Application → Bot → Privileged Gateway Intents.
 
-### Discord Setup
+### Access Control
 
-The bot requires the **Message Content Intent**.
+- Commands require a valid Discord guild context.
+- The configured minimum management permission is required.
+- Direct-message commands are rejected.
+- Missing or invalid permission configuration fails closed.
+- Authorization is checked before Windows operations.
 
-Enable it in both:
-- The Agent's intent configuration.
-- Discord Developer Portal → Application → Bot → Privileged Gateway Intents.
+Previously registered `/pc` slash commands may remain available until explicitly removed.
 
-Previously registered `/pc` slash commands may remain available until explicitly removed. To remove old registrations, review and run:
+To remove old slash-command registrations, review and run:
 
 ```powershell
 python scripts/clear_slash_commands.py
 ```
 
-This is an explicit operator action, not an automatic startup step.
+This is an explicit operator action and should not run automatically during startup.
 
-## Production Agent
+## Security
 
-The production executable is built with PyInstaller `--onefile --noconsole`.
+> [!WARNING]
+> **The current executable contains a recoverable Discord bot token. Packaging is not encryption.**
 
-When launched, the Agent loads its embedded payload, initializes the Discord client, handles authorized commands, and writes sanitized fatal errors to:
-
-```text
-%LOCALAPPDATA%\AstralRelay\agent-error.log
-```
-
-The current implementation also registers Windows automatic-start mechanisms through `HKCU Run` and a logon task, with a backup copy under `%APPDATA%\AstralRelay`.
-
-These behaviors must be understood before deployment. Run the Agent only on computers you own or are explicitly authorized to administer.
-
-## Security Considerations
-
-> [!CAUTION]
-> **The Discord bot token is embedded in the generated EXE as recoverable data. Anyone who obtains the executable may be able to extract the token.**
-
-Packaging does not encrypt the token. Obfuscation is not a substitute for protecting credentials.
+The token is embedded in the production payload. Anyone with access to the generated executable may be able to extract it.
 
 Recommended precautions:
 
-- Use a dedicated Discord bot with the minimum permissions required.
+- Use a dedicated Discord bot with the minimum required permissions.
 - Never use a personal Discord account token.
-- Do not distribute an executable containing a token that should remain secret.
-- Rotate the bot token immediately if exposure is suspected.
-- Never commit credentials, local configuration, or sensitive logs to Git.
-- Review the Agent's automatic-start behavior before deploying it.
-- Use the Agent only on systems you own or are authorized to manage.
+- Avoid distributing an executable containing a sensitive bot token.
+- Rotate the bot token if exposure is suspected.
+- Never commit credentials or sensitive local configuration to Git.
+- Review the Agent's automatic-start behavior before deployment.
+- Run the Agent only on systems you own or are authorized to administer.
 
-The current executable should be treated as an experimental, locally controlled build rather than a secure binary-distribution format.
+The current production implementation registers Windows automatic-start mechanisms through `HKCU Run` and a logon task, with a backup copy under `%APPDATA%\AstralRelay`.
+
+The Agent runs without a visible console window. Understand these behaviors before launching it or distributing the executable.
+
+**The current build should be treated as an experimental, locally controlled application rather than a secure binary-distribution format.**
 
 ## Testing
 
@@ -205,18 +249,32 @@ $env:ASTRAL_RUN_PACKAGING = "1"
 python -m pytest tests/python/packaging -q
 ```
 
-The test suite covers configuration validation, authorization, application discovery, process-launch restrictions, redaction, payload handling, and packaging behavior.
+The automated tests cover configuration validation, authorization, application discovery, process-launch restrictions, payload handling, output redaction, and packaging behavior.
 
-Automated tests may use mocks and test credentials. Passing them does not prove that live Discord authentication, all Windows operations, or every startup behavior works correctly.
+Tests using mocks or test credentials do not prove that live Discord authentication, all Windows operations, or every startup behavior works correctly.
 
-## Current Limitations
+## Known Limitations
 
-- Real Discord login, command execution, and permission enforcement require live integration testing.
-- Application discovery is based on supported Windows shortcuts and does not cover every Windows or Store application.
-- Non-ASCII shortcut targets may depend on the Windows-native resolver.
-- Each token-specific build currently requires repackaging.
+- Live Discord login and command execution require integration testing.
+- Application discovery relies on supported Windows shortcuts.
+- Some Windows Store and UWP applications are not discoverable.
+- Some shortcut targets require the Windows-native resolver.
+- Each token-specific build currently requires a full PyInstaller rebuild.
 - The embedded bot token can be extracted from the executable.
-- The Agent's automatic-start behavior should be reviewed before wider distribution.
+- Automatic-start behavior should be reviewed before wider deployment.
+
+## Project Status
+
+| Area | Status |
+|:--|:--|
+| Python CLI | Implemented |
+| Terminal interface | Implemented |
+| EXE packaging | Packaging tests passed |
+| Authorization | Automated tests available |
+| Live Discord integration | Pending verification |
+| Target-PC operations | Pending verification |
+
+Astral Relay remains experimental until live Discord integration and target-Windows operations have been verified.
 
 ## Project Structure
 
@@ -224,10 +282,10 @@ Automated tests may use mocks and test credentials. Passing them does not prove 
 astral-relay/
 ├── src/
 │   └── astral_relay/
-│       ├── cli/          # Interactive terminal interface
-│       ├── shared/       # Configuration, errors, logging
-│       ├── agent/        # Discord Agent and Windows operations
-│       └── builder/      # Payload generation and EXE packaging
+│       ├── cli/
+│       ├── shared/
+│       ├── agent/
+│       └── builder/
 ├── tests/
 │   └── python/
 │       ├── unit/
@@ -242,14 +300,19 @@ astral-relay/
 └── README.md
 ```
 
-## Astral Interactive
-
-Part of the **Astral Interactive** software project collection.
-
-[![GitHub](https://img.shields.io/badge/GitHub-Astral_Interactive-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Astral-Interactive-team)
-[![Telegram](https://img.shields.io/badge/Telegram-astral__int-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/astral_int)
-[![Discord](https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/bSvcQG8K4f)
-
 ---
 
-<sub>Developed by Astral Interactive.</sub>
+## Community
+
+<p align="center">
+  <a href="https://t.me/astral_int">
+    <img src="https://img.shields.io/badge/Telegram-astral__int-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Astral Interactive on Telegram">
+  </a>
+  <a href="https://discord.gg/bSvcQG8K4f">
+    <img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Astral Interactive Discord">
+  </a>
+</p>
+
+<p align="center">
+  <sub>Developed by Astral Interactive.</sub>
+</p>

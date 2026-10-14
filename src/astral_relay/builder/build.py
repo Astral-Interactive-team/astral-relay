@@ -60,6 +60,51 @@ def prompt_build_token() -> str:
     return prompt_for_token()
 
 
+DEFAULT_EXE_NAME = "AstralRelay-Agent.exe"
+
+
+def sanitize_exe_name(raw=None, default: str = DEFAULT_EXE_NAME) -> str:
+    """Validate a user-supplied EXE file name. Returns the file name only.
+
+    Empty input selects the default. Appends .exe when missing. Rejects
+    directories, traversal, drive letters, and Windows-invalid
+    characters. Never returns a path.
+    """
+    name = (raw or "").strip()
+    if name == "":
+        return default
+    if ".." in name or "/" in name or "\\" in name or ":" in name:
+        raise BuildError("Output name must be a plain file name, not a path.")
+    if any(ch in name for ch in '<>|?*"') or any(ord(ch) < 32 for ch in name):
+        raise BuildError('Output name contains invalid characters (<>|?*" or control codes).')
+    if len(name) > 100:
+        raise BuildError("Output name too long (max 100 characters).")
+    if not name.lower().endswith(".exe"):
+        name += ".exe"
+    return name
+
+
+def prompt_exe_name(default: str = DEFAULT_EXE_NAME) -> str:
+    """Ask for the output EXE name. Bare Enter selects the default."""
+    try:
+        sys.stdout.write(f"Output EXE name [{default}]: ")
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        readline = getattr(sys.stdin, "readline", None)
+        raw = readline() if callable(readline) else ""
+    except KeyboardInterrupt as exc:
+        raise InterruptedError("INTERRUPTED") from exc
+    except (EOFError, OSError, ValueError):
+        return default
+    try:
+        return sanitize_exe_name(raw, default)
+    except BuildError as err:
+        print(f"Invalid name ({err}); using default {default}.")
+        return default
+
+
 def resolve_build_token(token=None, prompt_token=None) -> str:
     """Resolve the build token from an argument or secure prompt, validated first."""
     prompt = prompt_token if prompt_token is not None else prompt_build_token
@@ -150,9 +195,10 @@ def _stage_log_path() -> Path:
     return DIST_DIR / f"build-py-{stamp}.log"
 
 
-def build_agent(token=None, prompt_token=None, on_stage=None) -> dict:
+def build_agent(token=None, prompt_token=None, on_stage=None, output_name: str | None = None) -> dict:
     """Generate the EXE with an embedded token plus default non-secret config."""
     staged_config = default_runtime_config()
+    output_exe = DIST_DIR / sanitize_exe_name(output_name or DEFAULT_EXE_NAME)
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_TMP.mkdir(parents=True, exist_ok=True)
     log_lines: list[str] = []
@@ -203,10 +249,10 @@ def build_agent(token=None, prompt_token=None, on_stage=None) -> dict:
             if report["returncode"] != 0:
                 raise BuildError(f"Self-test failed with exit code {report['returncode']}.")
             log("Verifying output")
-            _publish_with_retry(temp_exe, OUTPUT_EXE, log)
+            _publish_with_retry(temp_exe, output_exe, log)
             log(f"Payload embedded and verified: {version_line}")
-            info(f"Build done: {OUTPUT_EXE}")
-            return {"exe_path": str(OUTPUT_EXE), "version_line": version_line}
+            info(f"Build done: {output_exe}")
+            return {"exe_path": str(output_exe), "version_line": version_line}
         finally:
             _cleanup_tracked()
     except InterruptedError:

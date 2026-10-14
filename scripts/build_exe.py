@@ -9,12 +9,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from astral_relay.builder.build import build_agent  # noqa: E402
+from astral_relay.builder.build import build_agent, prompt_exe_name  # noqa: E402
 
 
 def main() -> int:
     try:
-        result = build_agent()
+        result = build_agent(output_name=prompt_exe_name())
     except KeyboardInterrupt:
         return 0
     except Exception as exc:  # noqa: BLE001 - build errors are user-safe by construction

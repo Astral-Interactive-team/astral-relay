@@ -300,7 +300,7 @@ def run_generate(console: Console, enabled: bool) -> bool:
     """Run the EXE build with staged progress reporting. Returns True on success."""
     from rich.text import Text as RichText
 
-    from astral_relay.builder.build import build_agent, prompt_build_token
+    from astral_relay.builder.build import build_agent, prompt_build_token, prompt_exe_name
 
     stages = ["Validating token", "Preparing template", "Injecting payload", "Verifying output"]
     try:
@@ -311,6 +311,10 @@ def run_generate(console: Console, enabled: bool) -> bool:
         console.print(status_panel("warn", str(err), enabled))
         wait_to_continue(console, enabled)
         return False
+    try:
+        output_name = prompt_exe_name()
+    except InterruptedError:
+        return False
     progress = Progress(
         SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
         console=console, disable=not console.is_terminal,
@@ -320,7 +324,7 @@ def run_generate(console: Console, enabled: bool) -> bool:
             task = progress.add_task("Building", total=len(stages))
             def on_stage(name: str) -> None:
                 progress.update(task, description=name, advance=1)
-            result = build_agent(token=token, on_stage=on_stage)
+            result = build_agent(token=token, on_stage=on_stage, output_name=output_name)
     except (InterruptedError, KeyboardInterrupt):
         # Build cancelled: stop only the build, back to menu.
         return False

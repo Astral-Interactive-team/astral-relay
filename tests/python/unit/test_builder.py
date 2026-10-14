@@ -32,6 +32,38 @@ class _FakePipe:
         return self._buf.getvalue()
 
 
+def test_sanitize_exe_name():
+    from astral_relay.builder.build import DEFAULT_EXE_NAME, sanitize_exe_name
+
+    assert sanitize_exe_name("") == DEFAULT_EXE_NAME
+    assert sanitize_exe_name(None) == DEFAULT_EXE_NAME
+    assert sanitize_exe_name("  ") == DEFAULT_EXE_NAME
+    assert sanitize_exe_name("MyAgent") == "MyAgent.exe"
+    assert sanitize_exe_name("MyAgent.EXE") == "MyAgent.EXE"
+    for bad in ("a/b.exe", "a\\b.exe", "C:x.exe", "..\\x.exe", 'a"b.exe', "a<b.exe", "x" * 101):
+        with pytest.raises(BuildError):
+            sanitize_exe_name(bad)
+
+
+def test_prompt_exe_name_default_and_invalid(monkeypatch, capsys):
+    import io
+    import sys as sys_mod
+
+    from astral_relay.builder import build as build_mod
+
+    class Answer(io.StringIO):
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys_mod, "stdin", Answer(""))
+    assert build_mod.prompt_exe_name() == build_mod.DEFAULT_EXE_NAME
+    monkeypatch.setattr(sys_mod, "stdin", Answer("a/b\n"))
+    assert build_mod.prompt_exe_name() == build_mod.DEFAULT_EXE_NAME
+    assert "Invalid name" in capsys.readouterr().out
+    monkeypatch.setattr(sys_mod, "stdin", Answer("Custom\n"))
+    assert build_mod.prompt_exe_name() == "Custom.exe"
+
+
 def test_resolve_token_validates_before_work():
     calls = []
     with pytest.raises(BuildError):
