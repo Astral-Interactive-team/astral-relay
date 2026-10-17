@@ -1,236 +1,88 @@
-# Discord prefix-command bot wiring: login, routing, shutdown.
+# Discord client wiring: login, category/#info maintenance, shutdown.
 # Production agent entry calls start_bot() after the token is available.
-# Commands use the ! prefix through a `pc` group: !pc status, !pc apps,
-# !pc open <id>, !pc lock. No slash commands, no CommandTree, no
-# application-command registration or synchronization live here; obsolete
-# slash commands are removed manually from the Discord Developer Portal.
-# Every routing path calls require_authorized before any Windows
-# operation. Prefix replies are ordinary messages, so failure text stays
-# generic and never carries system details.
-# on_message deletes member messages posted in a managed #info channel and
-# then hands the event to discord.py's prefix-command processor; because
-# this listener overrides the default, process_commands is always called.
-# on_resumed counts gateway session resumes for the #info agent section.
+# The agent exposes no commands: no prefix commands, no slash commands,
+# no CommandTree, and no application-command registration or
+# synchronization. Its only Discord work is to create or adopt the
+# managed per-computer category, publish the Components V2 system report
+# into the managed #info channel, and keep that channel clean.
+# on_message deletes member messages posted in a managed #info channel so
+# the report stays readable; bot messages and every other channel are
+# ignored. on_resumed counts gateway session resumes for the #info agent
+# section. Replies are never sent, so no reply text can leak system
+# details.
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
-from astral_relay.agent.commands.apps_cmd import handle_apps
-from astral_relay.agent.commands.lock_cmd import handle_lock
-from astral_relay.agent.commands.open_cmd import handle_open
-from astral_relay.agent.commands.status_cmd import handle_status
-from astral_relay.agent.security.authorize import require_authorized
-from astral_relay.agent.windows.apps import discover_catalog
-from astral_relay.shared.errors import AuthError, ConfigError
 from astral_relay.shared.logging_utils import error, info
 
-COMMAND_PREFIX = "!"
-USAGE = "Usage: !pc status | !pc apps [query] | !pc open <id> | !pc lock"
 
-
-def build_bot(config: dict, catalog_fn=None):
-    """Create the prefix-command bot. discord.py imports stay local to this function."""
+def build_bot(config: dict):
+    """Create the Discord client. discord.py imports stay local to this function."""
     import discord
-    from discord.ext import commands
 
     intents = discord.Intents.default()
     intents.guilds = True
+    # Message events are still received without this intent, but keeping
+    # it explicit preserves the ability to inspect member messages in
+    # managed #info channels on every supported discord.py version.
     intents.message_content = True
 
-    bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, case_insensitive=True, help_command=None)
+    client = discord.Client(intents=intents)
     # Gateway session resumes are counted here so the #info report can
     # show a real reconnect count instead of a placeholder.
-    bot._astral_reconnects = 0
-    discover = catalog_fn if catalog_fn is not None else discover_catalog
+    client._astral_reconnects = 0
 
-    def auth_source_of(ctx) -> dict[str, Any]:
-        guild = getattr(ctx, "guild", None)
-        author = getattr(ctx, "author", None)
-        permissions = getattr(author, "guild_permissions", None)
-        bits = getattr(permissions, "value", None) if permissions is not None else None
-        return {"inGuild": guild is not None, "permissions": bits}
-
-    def is_dm(ctx) -> bool:
-        return getattr(ctx, "guild", None) is None
-
-    async def fresh_catalog() -> list:
-        try:
-            result = discover()
-            if asyncio.iscoroutine(result):
-                result = await result
-            if isinstance(result, dict) and isinstance(result.get("apps"), list):
-                return result["apps"]
-            if isinstance(result, list):
-                return result
-            return []
-        except Exception:
-            return []
-
-    async def deny(ctx) -> bool:
-        """Run the gate. Returns True when the request was denied."""
-        try:
-            require_authorized(auth_source_of(ctx), config)
-            return False
-        except AuthError:
-            error("Rejected unauthorized command.")
-            try:
-                if is_dm(ctx):
-                    await ctx.send("Commands unavailable in DMs.")
-                else:
-                    await ctx.send("Not authorized.")
-            except Exception:
-                pass
-            return True
-
-    @bot.event
+    @client.event
     async def on_ready() -> None:
-        content = getattr(bot.intents, "message_content", False)
+        content = getattr(client.intents, "message_content", False)
         if not content:
-            error("Message Content Intent unavailable; prefix commands will be ignored. "
+            error("Message Content Intent unavailable; member messages in #info cannot be read. "
                   "Enable it in code and in the Developer Portal.")
         from astral_relay.agent.discord_setup import ensure_host_categories
         from astral_relay.agent.windows.info import get_hostname, get_machine_id
 
         try:
-            await ensure_host_categories(bot, get_hostname(), get_machine_id(), config=config)
+            await ensure_host_categories(client, get_hostname(), get_machine_id(), config=config)
         except Exception:
             pass
         info("Discord client ready.")
 
-    @bot.event
+    @client.event
     async def on_resumed() -> None:
         """Count gateway session resumes for the #info agent section."""
-        bot._astral_reconnects = int(getattr(bot, "_astral_reconnects", 0)) + 1
+        client._astral_reconnects = int(getattr(client, "_astral_reconnects", 0)) + 1
 
-    @bot.event
+    @client.event
     async def on_message(message) -> None:
-        """Delete member chatter in managed #info channels, then route commands.
+        """Delete member chatter in managed #info channels.
 
-        The information channel is bot-owned, so member messages sent there
-        are removed immediately and never reach the command processor. If
-        deletion is not permitted the message is left in place. Bot
-        messages and every other channel fall through to the regular
-        prefix-command processor.
+        The information channel is bot-owned, so member messages sent
+        there are removed immediately. If deletion is not permitted the
+        message is left in place. Bot messages and every other channel
+        are ignored: the agent registers no commands.
         """
         from astral_relay.agent.discord_setup import is_info_channel
 
-        member_post = not getattr(getattr(message, "author", None), "bot", False)
+        if getattr(getattr(message, "author", None), "bot", False):
+            return
         channel_id = getattr(getattr(message, "channel", None), "id", None)
         try:
-            info_channel = member_post and is_info_channel(channel_id)
+            info_channel = is_info_channel(channel_id)
         except Exception:
             info_channel = False
-        if info_channel:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            return
-        await bot.process_commands(message)
-
-    @bot.event
-    async def on_command_error(ctx, exc) -> None:
-        if is_dm(ctx):
-            try:
-                await ctx.send("Commands unavailable in DMs.")
-            except Exception:
-                pass
+        if not info_channel:
             return
         try:
-            from discord.ext.commands import CommandNotFound, MissingRequiredArgument, BadArgument
-
-            if isinstance(exc, (CommandNotFound, MissingRequiredArgument, BadArgument)):
-                await ctx.send(USAGE)
-                return
-        except ImportError:
-            pass
-        error("Command handler failed.")
-        try:
-            await ctx.send("Command failed.")
+            await message.delete()
         except Exception:
             pass
 
-    @bot.group(name="pc", invoke_without_command=True, case_insensitive=True)
-    async def pc(ctx) -> None:
-        if ctx.invoked_subcommand is None:
-            if await deny(ctx):
-                return
-            await ctx.send(USAGE)
-
-    # Explicit case-insensitive subcommand lookup: discord.py applies
-    # Bot(case_insensitive=True) to top-level names, but group child
-    # lookup is verified here instead of assumed. The override below
-    # lowercases child names so !PC STATUS and !Pc OpEn match.
-    _original_get_command = pc.get_command if hasattr(pc, "get_command") else None
-
-    def _casefold_get_command(name: str):
-        if _original_get_command is None:
-            return None
-        found = _original_get_command(name)
-        if found is None and isinstance(name, str):
-            found = _original_get_command(name.lower())
-        return found
-
-    if _original_get_command is not None:
-        try:
-            pc.get_command = _casefold_get_command  # type: ignore[method-assign]
-        except (AttributeError, TypeError):
-            pass
-
-    @pc.command(name="status")
-    async def pc_status(ctx) -> None:
-        if await deny(ctx):
-            return
-        try:
-            await handle_status(ctx, config)
-        except Exception:
-            error("Command handler failed.", {"sub": "status"})
-            await ctx.send("Command failed.")
-
-    @pc.command(name="apps")
-    async def pc_apps(ctx, *, query: str = "") -> None:
-        if await deny(ctx):
-            return
-        try:
-            await handle_apps(ctx, await fresh_catalog(), query or "")
-        except Exception:
-            error("Command handler failed.", {"sub": "apps"})
-            await ctx.send("Command failed.")
-
-    @pc.command(name="open")
-    async def pc_open(ctx, picked: str = "") -> None:
-        if await deny(ctx):
-            return
-        if not picked:
-            await ctx.send(USAGE)
-            return
-        try:
-            await handle_open(ctx, await fresh_catalog(), picked)
-        except Exception:
-            error("Command handler failed.", {"sub": "open"})
-            await ctx.send("Command failed.")
-
-    @pc.command(name="lock")
-    async def pc_lock(ctx) -> None:
-        if await deny(ctx):
-            return
-        try:
-            await handle_lock(ctx)
-        except Exception:
-            error("Command handler failed.", {"sub": "lock"})
-            await ctx.send("Command failed.")
-
-    return bot
+    return client
 
 
-async def start_bot(config: dict, token: str, catalog_fn=None):
+async def start_bot(config: dict, token: str):
     """Log in and run until interrupted. Caller owns shutdown signaling."""
-    enabled = set(config.get("enabledCommands") or [])
-    if not enabled:
-        raise ConfigError("enabledCommands must list at least one command.")
-    bot = build_bot(config, catalog_fn=catalog_fn)
+    client = build_bot(config)
     info("Logging in to Discord.")
-    await bot.start(token.strip())
-    return bot
+    await client.start(token.strip())
+    return client

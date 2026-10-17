@@ -12,15 +12,14 @@
 # cached in memory, so a reconnect never republishes the report. Existing
 # duplicates left by older builds are reported for administrator review
 # and never deleted. Missing Manage Channels permission or HTTP failures
-# only warn and are not retried in a loop. Contains no slash-command
-# logic; prefix-only operation is unaffected.
+# only warn and are not retried in a loop. The agent exposes no Discord
+# commands, so this module owns the whole Discord surface besides login.
 
 from __future__ import annotations
 
 import asyncio
 
 from astral_relay.agent.identity import StateStore
-from astral_relay.shared.config import DEFAULT_PERMISSION
 from astral_relay.shared.logging_utils import info, warn
 
 MAX_CATEGORY_NAME = 100
@@ -327,8 +326,6 @@ class CategoryManager:
             "latencySeconds": link.get("latencySeconds"),
             "reconnects": link.get("reconnects"),
             "connection": "Connected",
-            "enabledCommands": settings.get("enabledCommands"),
-            "requiredPermission": settings.get("requiredPermission") or DEFAULT_PERMISSION,
             "categoryStatus": self._category_status.get(guild_id),
             "channelCount": self._channel_counts.get(guild_id),
             "duplicateWarning": (

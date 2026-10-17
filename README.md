@@ -29,7 +29,7 @@
 
 **Astral Relay** is a Python-based CLI application that builds a standalone Windows executable and connects it directly to Discord.
 
-It combines a custom Rich terminal interface, Windows application discovery, permission-controlled commands, and single-file executable packaging.
+It combines a custom Rich terminal interface, Windows Agent packaging, and a read-only Discord system-information dashboard.
 
 No separate Astral Relay backend server is required.
 
@@ -48,31 +48,17 @@ The startup banner is stored in `astral_relay/cli/banner.txt`. The development C
 
 ### Discord Agent
 
-The Agent connects to Discord and processes supported prefix commands.
-
-| Command | Description |
-|:--|:--|
-| `!pc status` | Display basic Agent and system status |
-| `!pc apps` | List discovered applications |
-| `!pc apps <query>` | Search the application catalog |
-| `!pc open <id>` | Launch a discovered application |
-| `!pc lock` | Lock the current Windows session |
-
-Commands are case-insensitive. For example, `!PC STATUS` is equivalent to `!pc status`.
+The Agent connects to Discord with no commands of any kind: no prefix commands, no slash commands, and no command registration or synchronization. Its only Discord work is to create or adopt its managed per-computer category, publish the read-only system report to the managed `#info` channel, and keep that channel clean by deleting member messages posted there.
 
 ### System Information Dashboard
 
-Each managed computer publishes a full system report to its managed `#info` channel using Discord **Components V2**. The report is read-only and lists device identity, Windows/OS, CPU, memory, graphics, firmware, storage, network, power, security, installed software, processes, services, performance counters, environment availability, and Agent state.
+Each managed computer publishes a full system report to its managed `#info` channel using Discord **Components V2**. The report is read-only and is organized into a fixed set of topical messages, in this order: **Overview** (always first), **Windows & Operating System**, **Processor & Memory**, **Graphics & Firmware**, **Storage**, **Network & Power**, **Security & Updates**, and **Performance & Agent**. Each topic is published as its own message, so a reader can identify and open only the part they need; the topic heading is repeated at the top of every message, and a topic that outgrows one message continues in additional messages in order.
 
-There are no select menus, no pagination buttons, and no repeat commands. When the report does not fit in one message it continues in additional messages that are appended in order. Nothing is summarized or omitted, and facts the Agent cannot read are reported as `Unavailable` or `Not supported` instead of being guessed. See [System Report](#system-report) for what is and is not collected.
+The Overview is a dashboard rather than a duplicate of the detail messages: it carries the computer identity, the Agent status, the operating system and Agent versions, the last update time, and the headline CPU, memory, and per-drive usage figures. Only the fixed local drives are listed there, and removable, network, and optical volumes are grouped into one line; full capacity, file-system, and BitLocker detail stays in the Storage topic.
 
-### Windows Application Discovery
+The report deliberately contains **no process inventory, no service inventory, and no installed-software inventory**. It never lists running programs, process IDs, per-process CPU or memory, Windows services, installed applications, or the default browser.
 
-Astral Relay discovers supported applications through Windows Start Menu shortcuts.
-
-The application catalog is generated locally. `/pc open` is not used; the Python Agent uses the `!pc open <id>` prefix command and validates the selected application before launching it.
-
-Unsupported shortcut types and unresolved executable targets are handled conservatively.
+There are no select menus, no pagination buttons, and no user-input controls. Every message opens with its title and position, `# Astral Relay — System Information (Part N of M)`, followed by its topic heading `## <topic>`. A topic that spans several messages simply repeats its heading; no continuation marker is ever printed, because the part number already carries the order. Nothing is summarized away or omitted, and facts the Agent cannot read are reported as `Unavailable` (or `Not supported` for features the platform does not expose) instead of being guessed. See [System Report](#system-report) for what is and is not collected.
 
 ### Executable Builder
 
@@ -206,9 +192,9 @@ Each token-specific build currently requires a full PyInstaller rebuild, which c
 
 ## Discord Setup
 
-The Python Agent uses **prefix commands**, not slash commands.
+The Python Agent exposes **no commands**: no prefix commands and no slash commands. It only manages its per-computer category and publishes the read-only system report.
 
-The bot requires the **Message Content Intent** to process messages beginning with `!pc`.
+The bot requires the **Message Content Intent** so it can receive and delete member messages posted in its managed `#info` channel.
 
 Enable the intent in both:
 
@@ -219,13 +205,9 @@ The bot also needs **Manage Channels** to create the managed category and its `#
 
 ### Access Control
 
-- Commands require a valid Discord guild context.
-- The configured minimum management permission is required.
-- Direct-message commands are rejected.
-- Missing or invalid permission configuration fails closed.
-- Authorization is checked before Windows operations.
+There is nothing to authorize, because the Agent registers no commands and never acts on operator input.
 
-Previously registered `/pc` slash commands may remain visible in Discord until removed.
+Previously registered `/pc` slash commands and the old `!pc` prefix commands (`status`, `apps`, `open`, `lock`) have been removed from the codebase. Old slash registrations may remain visible in Discord until removed.
 
 The Agent no longer ships a removal script. Remove old registrations manually from the **Discord Developer Portal** (Application → Commands) if they still appear. This is an explicit operator action and never runs automatically during startup.
 
@@ -241,26 +223,47 @@ Each Agent installation manages exactly one category per guild.
 Channels are added to the managed category one at a time, starting with `#info`:
 
 - The bot creates a single `#info` text channel inside the category and publishes this computer's full system report there using Discord **Components V2** (no embeds, no select menus, no pagination). The channel ID and the ordered report message IDs are remembered in `identity.json`, so later starts refresh the same messages instead of posting duplicates.
-- The report lists every collected fact from top to bottom. When it does not fit in one message, it continues in additional messages that are appended in order; sections that span a message boundary repeat their heading with `(continued)`.
-- Long lists are never summarized or truncated: every installed application, every running process, and every service is listed.
+- The report follows the fixed topic order above, starting with the Overview. Each message opens with `# Astral Relay — System Information (Part N of M)` and its topic heading `## <topic>`, so the order stays readable even when a topic spans several messages.
+- Long lists are never summarized or truncated: every collected item is listed in full, and a list is split only at a section or item boundary, never mid-item.
+- Process, service, and installed-software inventories are not collected or shown at all.
 - Values the Agent genuinely cannot read are shown as `Unavailable`, and features the platform does not expose are shown as `Not supported`. No placeholder numbers are invented.
-- Member messages posted in `#info` are deleted immediately, and are never treated as commands. Bots and members can keep using `!pc ...` in the category's other channels.
+- Utilization at or above 80% is marked `- High` and at or above 90% `- Critical`, in text and in the message accent colour together.
+- Member messages posted in `#info` are deleted immediately. The Agent registers no commands, so nothing posted anywhere is acted upon.
 
 ### System Report
 
 The report is produced by two modules:
 
-- `astral_relay/agent/windows/inventory.py` collects the facts with read-only registry reads, ctypes calls, the existing Start Menu catalog, and a single base64-encoded PowerShell CIM pass. Each probe is guarded, so a partial failure only marks its own fields `Unavailable`.
+- `astral_relay/agent/windows/inventory.py` collects the facts with read-only registry reads, ctypes calls, and a single base64-encoded PowerShell CIM pass. Each probe is guarded, so a partial failure only marks its own fields `Unavailable`.
 - `astral_relay/agent/info_report.py` renders, splits, and publishes the Components V2 messages.
 
-Collected sections: device identity, Windows/OS, CPU, memory (with modules and page file), graphics and displays, motherboard/BIOS/TPM/Secure Boot, storage (logical volumes, physical disks, health, BitLocker), network (per adapter), power and battery, Windows security and updates, installed software, processes and services, live performance counters, system directories and environment availability, and Agent state.
+Collected sections, in publication order:
+
+1. **Overview** — hostname, installation ID, local and public IPv4, Agent status and version, operating system and version, last update time, CPU utilization, memory usage, per-drive usage and free space, and disk health. Fixed local volumes are listed one by one; removable, network, and optical volumes are grouped into a single line.
+2. **Windows & Operating System** — edition and build (OS name, manufacturer, version, build number, feature update, edition, architecture, configuration, build type), Windows registration (registered owner and organization, Windows product ID, original install date), runtime (boot time, uptime, system and input locale, time zone), and domain and directories (domain/workgroup, domain joined, Windows and system directories, boot device, firmware architecture).
+3. **Processor & Memory** — CPU manufacturer, model, identifier, architecture, physical and logical core counts, maximum and current clock speed, L2/L3 cache, virtualization firmware support, SLAT, hypervisor presence, utilization, and temperature; then total, used, and available physical memory, usage percentage, total and available virtual memory, page file size and usage, module count, and one line per installed module.
+4. **Graphics & Firmware** — one bold block per graphics adapter (manufacturer, driver version and date, dedicated memory, resolution, refresh rate, HDR, adapter status) plus a single grouped `Monitoring: Not supported (...)` line naming each unsupported meter; then system and motherboard facts, BIOS version and release date, firmware mode, Secure Boot, and TPM availability, version, and firmware.
+5. **Storage** — every logical volume (drive type, file system, label, total, used, free, used percentage), every physical drive (model, media type, interface, capacity, health, state, temperature, wear), and every BitLocker volume (protection, encryption state, method, percentage).
+6. **Network & Power** — connectivity summary (internet reachability, public IPv4, adapter count, Discord gateway state and latency), one bold block per adapter (description, IPv4, IPv6, subnet mask, default gateway, DNS servers, DHCP state and server, MAC address, link speed, received and sent bytes), and power and battery facts.
+7. **Security & Updates** — Windows Defender status, real-time protection, signature version and update time; one line per firewall profile (Domain, Private, Public); last installed update, hotfix count, and pending update state; UAC state and prompt configuration; and a single combined platform-security line for Secure Boot, TPM, and BitLocker.
+8. **Performance & Agent** — live performance counters with their sampling window and timestamp, the Agent's own state (version, installation ID, uptime, Discord connection and latency, reconnect count, required management permission, managed category and channel state, duplicate-category warning, startup registration, backup executable, diagnostic-log summary), and Agent state-directory availability.
+
+The layout uses only the three heading levels Discord renders: `#` for the message title, `##` for the message topic, and `###` for a section inside a topic, with `**Label:** value`, `**Item n: name**`, and `- bullet` lines for detail. Discord exposes no fourth heading level, so individual GPUs, memory modules, network adapters, and drives use bold item headers instead of a deeper heading.
+
+Duplicate facts are kept in exactly one place: the Windows and system directories are reported once in the Windows & Operating System topic, the Secure Boot, TPM, and BitLocker details live in the firmware and storage topics with only a combined summary line under Security & Updates, and the Overview shows only the values whose full detail appears in a later topic.
+
+Utilization that runs high is marked in words and in the message accent colour together, never by colour alone: at 80% or above a value is suffixed `- High`, and at 90% or above `- Critical`, which also switches the message's container accent to amber or red. The default accent colour is the Astral Relay purple.
+
+The report collects **no process inventory, no service inventory, and no installed-software inventory**. Running programs, process IDs, per-process CPU or memory, Windows services, installed applications, Start Menu entry counts, and the default browser are neither read nor rendered.
 
 What the collector deliberately does not read or send:
 
 - No tokens, passwords, product keys, cookies, credentials, clipboard contents, keystrokes, audio, camera, screen captures, file contents, or process memory.
 - Only the Windows **Product ID** is read; the product key is never touched.
-- Disk, service, BitLocker, TPM, and Defender probes are read-only.
-- Process command lines and environment-variable values are never read; the environment section reports only which directories exist.
+- Disk, BitLocker, TPM, and Defender probes are read-only.
+- Process command lines and environment-variable values are never read; the Agent environment section reports only which directories exist.
+
+Every helper process the Agent starts (the PowerShell CIM pass, `schtasks`, and `taskkill`) is created with the Windows `CREATE_NO_WINDOW` flag. Because the production EXE is built with `--noconsole`, this is what keeps those helpers from flashing a console window.
 
 The only outbound request is one short-timeout HTTPS lookup of the public IPv4 address (`api.ipify.org`, falling back to `icanhazip.com`). It sends no credentials and no identifiers beyond the HTTP request itself. If it fails, the field shows `Unavailable`.
 
@@ -308,21 +311,21 @@ $env:ASTRAL_RUN_PACKAGING = "1"
 python -m pytest tests/python/packaging -q
 ```
 
-The automated tests cover configuration validation, authorization, application discovery, process-launch restrictions, payload handling, per-installation category management, output redaction, and packaging behavior.
+The automated tests cover configuration validation, payload handling, per-installation category management, output redaction, and packaging behavior.
 
 Tests using mocks or test credentials do not prove that live Discord authentication, all Windows operations, or every startup behavior works correctly.
 
 ## Known Limitations
 
-- Live Discord login and command execution require integration testing.
-- Application discovery relies on supported Windows shortcuts.
-- Some Windows Store and UWP applications are not discoverable.
-- Some shortcut targets require the Windows-native resolver.
+- Live Discord login and category/report publishing require integration testing.
 - Each token-specific build currently requires a full PyInstaller rebuild.
 - The embedded bot token can be extracted from the executable.
 - Automatic-start behavior should be reviewed before wider deployment.
-- The system report is published only to managed `#info` channels and is not exposed as a prefix command.
+- The system report is published only to managed `#info` channels; the Agent exposes no commands to fetch it on demand.
+- The report deliberately omits process, service, and installed-software inventories.
+- Utilization thresholds (`- High` at 80%, `- Critical` at 90%) and the matching accent colours are fixed constants, not user-configurable.
 - Report updates happen when the Agent starts; deleting a report message makes the Agent repost it on the next start.
+- The `CREATE_NO_WINDOW` flags for helper processes are covered by unit tests, but their effect has not been observed live from a rebuilt `--noconsole` EXE.
 
 ## Project Status
 
@@ -331,9 +334,8 @@ Tests using mocks or test credentials do not prove that live Discord authenticat
 | Python CLI | Implemented |
 | Terminal interface | Implemented |
 | EXE packaging | Packaging tests passed |
-| Authorization | Automated tests available |
+| System report collection | Automated tests available |
 | Live Discord integration | Pending verification |
-| Target-PC operations | Pending verification |
 
 Astral Relay remains experimental until live Discord integration and target-Windows operations have been verified.
 

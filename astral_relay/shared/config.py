@@ -11,48 +11,9 @@ from typing import Any
 from astral_relay import AGENT_VERSION
 from astral_relay.shared.errors import ConfigError
 
-VALID_COMMANDS = ["status", "open", "apps", "lock"]
-DEFAULT_PERMISSION = "ManageGuild"
 DEFAULT_STARTUP_NAME = "AstralRelay"
 
-PERMISSION_NOTES = {
-    "Administrator": "Full server ownership: holders already control roles, bots, and settings. Widest access.",
-    "ManageGuild": "Server managers: trusted operators who change settings and manage bots. Recommended default.",
-    "ManageRoles": "WARNING: role managers can grant themselves Administrator, so this equals Administrator in practice.",
-    "ManageChannels": "Channel managers: structural control over channels, no server-wide settings or bot control.",
-    "ManageMessages": "Moderators: message cleanup only, no settings or role control. Weak; widens operator pool.",
-    "ManageThreads": "Thread moderators only. Weak; widens operator pool.",
-    "ManageEvents": "Event managers only. Weak; widens operator pool.",
-    "ManageNicknames": "Nickname managers only. Weak; widens operator pool.",
-    "ModerateMembers": "Timeout managers only. Weak; widens operator pool.",
-    "ManageWebhooks": "Webhook managers: can pipe channel content outward. Weak; widens operator pool.",
-    "ViewAuditLog": "Auditors: read-only log access plus PC control. Weakest; widens operator pool.",
-    "KickMembers": "Kick power only. Weak; widens operator pool.",
-    "BanMembers": "Ban power only. Weak; widens operator pool.",
-}
-
-VALID_PERMISSIONS = [
-    "Administrator",
-    "ManageGuild",
-    "ManageRoles",
-    "ManageChannels",
-    "ManageMessages",
-    "ManageThreads",
-    "ManageEvents",
-    "ManageNicknames",
-    "ModerateMembers",
-    "ManageWebhooks",
-    "ViewAuditLog",
-    "KickMembers",
-    "BanMembers",
-]
-
 _LEGACY_KEYS = ("guildId", "applicationId", "authorizedUserIds", "allowedApps")
-
-
-def permission_note(name: str) -> str | None:
-    """Return the implication note for a permission name, or None when unknown."""
-    return PERMISSION_NOTES.get(name)
 
 
 def default_runtime_config(install_to_appdata: bool = True, enable_autostart: bool = True,
@@ -66,8 +27,6 @@ def default_runtime_config(install_to_appdata: bool = True, enable_autostart: bo
     """
     name = str(startup_name).strip() or DEFAULT_STARTUP_NAME
     return {
-        "requiredPermission": DEFAULT_PERMISSION,
-        "enabledCommands": ["status", "open", "apps", "lock"],
         "agentVersion": AGENT_VERSION,
         "installToAppData": bool(install_to_appdata),
         "enableAutostart": bool(enable_autostart),
@@ -80,16 +39,6 @@ def validate_config(raw: Any) -> list[str]:
     problems: list[str] = []
     if raw is None or not isinstance(raw, dict) or isinstance(raw, list):
         return ["Configuration must be a JSON object."]
-    if not isinstance(raw.get("requiredPermission"), str) or raw.get("requiredPermission") not in VALID_PERMISSIONS:
-        problems.append(f"requiredPermission must be one of: {', '.join(VALID_PERMISSIONS)}.")
-    enabled = raw.get("enabledCommands")
-    if not isinstance(enabled, list) or len(enabled) == 0:
-        problems.append("enabledCommands must list at least one of: status, open, apps, lock.")
-    else:
-        for name in enabled:
-            if name not in VALID_COMMANDS:
-                problems.append(f"enabledCommands holds unknown command: {name}.")
-                break
     if not isinstance(raw.get("agentVersion"), str) or raw.get("agentVersion") == "":
         problems.append("agentVersion must be a non-empty string.")
     for flag in ("installToAppData", "enableAutostart"):

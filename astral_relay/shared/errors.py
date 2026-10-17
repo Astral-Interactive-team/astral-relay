@@ -17,13 +17,6 @@ class ConfigError(RelayError):
         super().__init__(message, "CONFIG_ERROR")
 
 
-class AuthError(RelayError):
-    """Rejected Discord command (wrong guild or permissions). Never logs token."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "AUTH_ERROR")
-
-
 class BuildError(RelayError):
     """EXE build failure. Message holds actionable cause, no secrets."""
 

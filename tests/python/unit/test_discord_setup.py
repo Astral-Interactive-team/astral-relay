@@ -113,7 +113,7 @@ class FakeGuild:
 def stub_collector(full=False):
     """Build a collector stub shaped like the real inventory.
 
-    `full` adds a large installed-software list so one inventory spans
+    `full` adds a long network adapter list so one inventory spans
     several report messages, letting tests exercise growth and shrink
     without running a real scan.
     """
@@ -129,10 +129,26 @@ def stub_collector(full=False):
             "agent": {"version": agent.get("agentVersion"), "connection": "Connected"},
         }
         if full:
-            inventory["software"] = {
-                "count": "400",
-                "items": [
-                    {"name": f"App {index:03d}", "version": "1.0", "publisher": "Vendor"}
+            inventory["network"] = {
+                "internetConnectivity": "Reachable",
+                "adapters": [
+                    {
+                        "name": f"Adapter{index:03d}",
+                        "description": f"Contoso Adapter {index:03d}",
+                        "status": "Up",
+                        "virtual": "No",
+                        "ipv4": "192.168.1.20/24",
+                        "ipv6": "None",
+                        "subnet": "255.255.255.0",
+                        "gateway": "192.168.1.1",
+                        "dns": "192.168.1.1",
+                        "dhcpEnabled": "Yes",
+                        "dhcpServer": "192.168.1.1",
+                        "mac": "AA-BB-CC-DD-EE-FF",
+                        "linkSpeed": "1 Gbps",
+                        "received": "1.0 GB",
+                        "sent": "512.0 MB",
+                    }
                     for index in range(400)
                 ],
             }
@@ -194,11 +210,14 @@ def test_first_startup_creates_info_channel_with_system_report(tmp_path):
     assert [channel.name for channel in category.channels] == [INFO_CHANNEL_NAME]
     channel = category.channels[0]
     assert len(channel.sent) == expected_parts(agent)
-    text = view_text(channel.sent[0])
-    assert "Astral Relay" in text and "System Information" in text
-    assert "ONLINE" in text
-    assert "**Agent version:** 9.9.9" in text
-    assert "## Device Identity" in text
+    headline = view_text(channel.sent[0])
+    assert "Astral Relay" in headline and "System Information" in headline
+    assert "ONLINE" in headline
+    assert "**Agent version:** 9.9.9" in headline
+    assert "## Overview" in headline
+    text = "\n".join(view_text(view) for view in channel.sent)
+    assert "## Windows & Operating System" in text
+    assert "## Performance & Agent" in text
     # Every part must stay inside the Discord message limits.
     assert all(view.content_length() <= 4000 for view in channel.sent)
     assert all(view.total_children_count <= 40 for view in channel.sent)
@@ -242,10 +261,20 @@ def test_report_is_split_and_rejoined_in_order(tmp_path):
     assert parts > 2  # a long report really does span several messages
     assert len(channel.sent) == parts
     combined = "\n".join(view_text(view) for view in channel.sent)
-    # The heading appears once and continuations are clearly marked.
-    assert combined.count("## Installed Software\n") == 1
-    assert "## Installed Software (continued)" in combined
-    assert "App 000" in combined and "App 399" in combined
+    # A topic that spans several messages repeats its heading on each one, and
+    # is never marked as a continuation.
+    from astral_relay.agent.info_report import build_report
+
+    _, pages = build_report(stub_collector(full=True)(agent))
+    network_pages = sum(1 for page in pages if page[0].group == "Network & Power")
+    assert network_pages > 1
+    assert combined.count("## Network & Power\n") == network_pages
+    assert "(continued)" not in combined
+    assert "### Network Adapters" in combined
+    assert "Adapter000" in combined and "Adapter399" in combined
+    # Every message names its part so the order stays readable.
+    assert "(Part 1 of " in combined
+    assert "(Part 2 of " in combined
 
     # A shorter report must remove the messages it no longer needs.
     restarted = CategoryManager("HOST", "machineid", state_path=path, collect_fn=stub_collector())

@@ -29,14 +29,14 @@ def test_codegen_roundtrip():
     exec(compile(source, "_embedded_payload", "exec"), namespace)
     assert namespace["PAYLOAD_V"] == PAYLOAD_VERSION
     assert namespace["TOKEN"] == TOKEN_A
-    assert namespace["CONFIG"]["requiredPermission"] == "ManageGuild"
+    assert namespace["CONFIG"]["startupName"] == "AstralRelay"
 
 
 def test_codegen_rejects_bad_token_and_config():
     with pytest.raises(BuildError):
         render_payload_module("junk", default_runtime_config())
     bad = dict(default_runtime_config())
-    bad["requiredPermission"] = "Nope"
+    bad["agentVersion"] = ""
     with pytest.raises(BuildError):
         render_payload_module(TOKEN_A, bad)
 

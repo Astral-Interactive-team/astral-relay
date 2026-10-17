@@ -5,6 +5,9 @@
 # needs no administrator rights. Only frozen builds ever install or
 # touch the registry; development runs are always skipped. Failures are
 # best-effort and never stop the agent.
+# Every helper process (schtasks, taskkill) is started with
+# CREATE_NO_WINDOW so a --noconsole agent never flashes a console window
+# while it checks or registers its own startup entry.
 
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import sys
 from pathlib import Path
 
 from astral_relay.shared.config import DEFAULT_STARTUP_NAME
+from astral_relay.shared.winproc import hidden_kwargs
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 BACKUP_FILENAME = "AstralRelay-Agent.exe"
@@ -152,6 +156,7 @@ def terminate_holders(exe_path: str) -> int:
             ["taskkill", "/F", "/IM", os.path.basename(exe_path),
              "/FI", f"PID ne {own_pid}"],
             capture_output=True, shell=False, timeout=30,
+            **hidden_kwargs(),
         )
         return 1 if proc.returncode == 0 else 0
     except (OSError, subprocess.SubprocessError):
@@ -169,6 +174,7 @@ def ensure_logon_task(exe_path: str, task_name=None) -> str:
         check = subprocess.run(
             ["schtasks", "/query", "/tn", name],
             capture_output=True, shell=False, timeout=30,
+            **hidden_kwargs(),
         )
         if check.returncode == 0:
             return "current"
@@ -176,6 +182,7 @@ def ensure_logon_task(exe_path: str, task_name=None) -> str:
             ["schtasks", "/create", "/tn", name, "/tr", f'"{exe_path}"',
              "/sc", "onlogon", "/rl", "limited", "/f"],
             capture_output=True, shell=False, timeout=30,
+            **hidden_kwargs(),
         )
         return "added" if created.returncode == 0 else "failed"
     except (OSError, subprocess.SubprocessError):
@@ -291,6 +298,7 @@ def read_registration(startup_name=None, env=None) -> dict:
         check = subprocess.run(
             ["schtasks", "/query", "/tn", name],
             capture_output=True, shell=False, timeout=30,
+            **hidden_kwargs(),
         )
         result["logonTask"] = "present" if check.returncode == 0 else "absent"
     except (OSError, subprocess.SubprocessError):

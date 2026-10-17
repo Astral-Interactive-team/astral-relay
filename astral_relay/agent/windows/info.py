@@ -1,9 +1,8 @@
-# Read-only host facts for !pc status replies and the managed #info channel.
-# Returns connection state, platform, architecture, agent version,
-# hostname, and uptime. The hostname lets the operator tell managed
-# computers apart. format_status renders the compact reply for !pc status;
-# the full #info dashboard is built from windows/inventory.py. Still
-# exposes no usernames, SIDs, or local paths.
+# Read-only host facts for the managed #info channel.
+# Returns hostname, machine ID, local IPv4, and process uptime. The
+# hostname lets the operator tell managed computers apart; the full #info
+# dashboard is built from windows/inventory.py. Still exposes no
+# usernames, SIDs, or local paths.
 
 from __future__ import annotations
 
@@ -73,31 +72,3 @@ def get_uptime_seconds() -> int:
     """Return whole seconds since this Agent process started."""
     return int(time.monotonic() - _START)
 
-
-def get_status(agent_version: str, connected: bool) -> dict:
-    """Build a status snapshot. Pure, safe to call on every command."""
-    uname = platform.uname()
-    return {
-        "connected": connected,
-        "platform": uname.system,
-        "arch": uname.machine,
-        "release": uname.release,
-        "agentVersion": agent_version,
-        "hostname": get_hostname(),
-        "hostId": get_machine_id(),
-        "localIp": get_local_ip(),
-        "uptimeSeconds": get_uptime_seconds(),
-    }
-
-
-def format_status(status: dict) -> str:
-    """Render a snapshot as a single Discord-safe reply text block."""
-    state = "connected" if status.get("connected") else "starting"
-    return (
-        f"Status: {state}\n"
-        f"Host: {status.get('hostname', 'unknown-host')} ({status.get('hostId', 'unknown-id')})\n"
-        f"IP: {status.get('localIp', 'unknown-ip')}\n"
-        f"Platform: {status.get('platform')} {status.get('arch')} ({status.get('release')})\n"
-        f"Agent: v{status.get('agentVersion')}\n"
-        f"Uptime: {status.get('uptimeSeconds')}s"
-    )

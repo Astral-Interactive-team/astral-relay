@@ -1,12 +1,16 @@
 # Read-only Windows system inventory collector for the #info dashboard.
 # Gathers every fact the Components V2 report renders, without changing
-# system state: registry reads, ctypes calls for CPU/memory/power, the
-# existing Start Menu catalog, and one PowerShell CIM pass for hardware
-# facts that need it. Each part is guarded separately, so one failing
-# probe only marks its own fields Unavailable and never aborts the rest.
+# system state: registry reads, ctypes calls for CPU/memory/power, and one
+# PowerShell CIM pass for hardware facts that need it. Each part is guarded
+# separately, so one failing probe only marks its own fields Unavailable
+# and never aborts the rest.
 # Values are returned display-ready (already formatted strings) so the
 # renderer stays a pure layout step. No secrets, tokens, product keys, or
-# command lines are read; disk and security probes are read-only.
+# command lines are read; the disk and security probes are read-only. Process,
+# service, and installed-software inventories are deliberately not collected,
+# because the report does not show them.
+# Every child process is spawned with CREATE_NO_WINDOW so a --noconsole
+# Agent never flashes a console window while collecting.
 
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+
+from astral_relay.shared.winproc import hidden_kwargs
 
 UNAVAILABLE = "Unavailable"
 NOT_SUPPORTED = "Not supported"
@@ -63,8 +69,6 @@ try { $o.secureBoot = Confirm-SecureBootUEFI } catch {}
 try { $o.defender = Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled, AntispywareEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled, NISEnabled, AMServiceEnabled, AntivirusSignatureVersion, @{n='AntivirusSignatureLastUpdated';e={try{$_.AntivirusSignatureLastUpdated.ToString('yyyy-MM-dd HH:mm:ss')}catch{''}}} } catch {}
 try { $o.firewall = @(Get-NetFirewallProfile | Select-Object Name, Enabled) } catch {}
 try { $o.hotfixes = @(Get-CimInstance -ClassName Win32_QuickFixEngineering | Select-Object HotFixID, Description, @{n='InstalledOn';e={try{$_.InstalledOn.ToString('yyyy-MM-dd')}catch{''}}}) } catch {}
-try { $o.services = @(Get-Service | Select-Object Name, DisplayName, Status, StartType) } catch {}
-try { $o.processes = @(Get-Process | Select-Object Id, ProcessName, CPU, WorkingSet64) } catch {}
 try { $o.diskPerf = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Select-Object Name, DiskReadBytesPerSec, DiskWriteBytesPerSec, PercentDiskTime) } catch {}
 try { $o.netPerf = @(Get-CimInstance -ClassName Win32_PerfFormattedData_Tcpip_NetworkInterface | Select-Object Name, BytesReceivedPersec, BytesSentPersec, BytesTotalPersec) } catch {}
 try { $o.thermal = @(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature | Select-Object InstanceName, CurrentTemperature) } catch {}
@@ -213,28 +217,6 @@ def registry_value(root_name: str, path: str, name: str):
             return value
     except (ImportError, OSError, AttributeError):
         return None
-
-
-def registry_subkeys(root_name: str, path: str) -> list[str]:
-    """List immediate subkey names under a registry path. Never raises."""
-    try:
-        import winreg
-
-        root = getattr(winreg, root_name, None)
-        if root is None:
-            return []
-        names: list[str] = []
-        with winreg.OpenKey(root, path) as key:
-            index = 0
-            while True:
-                try:
-                    names.append(winreg.EnumKey(key, index))
-                except OSError:
-                    break
-                index += 1
-        return names
-    except (ImportError, OSError, AttributeError):
-        return []
 
 
 class _FileTime(ctypes.Structure):
@@ -420,8 +402,11 @@ def run_powershell_json(script: str, timeout: float = PS_TIMEOUT_S, runner=None)
         if runner is not None:
             payload = execute(command)
         else:
+            # CREATE_NO_WINDOW keeps the console child invisible; without
+            # it a --noconsole Agent flashes a black PowerShell window.
             proc = execute(
                 command, capture_output=True, shell=False, timeout=timeout,
+                **hidden_kwargs(),
             )
             payload = proc.stdout or b""
     except Exception:  # noqa: BLE001 - timeouts and spawn failures are both Unavailable
@@ -448,7 +433,6 @@ _BIOS_KEY = r"HARDWARE\DESCRIPTION\System\BIOS"
 _CPU_KEY = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
 _UAC_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 _SECUREBOOT_KEY = r"SYSTEM\CurrentControlSet\Control\SecureBoot\State"
-_BROWSER_KEY = r"SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
 
 
 def _local_facts(env=None, now=None) -> dict:
@@ -497,7 +481,6 @@ def _local_facts(env=None, now=None) -> dict:
         "firmwareType": _firmware_type(),
         "uacEnabled": format_flag(registry_value("HKEY_LOCAL_MACHINE", _UAC_KEY, "EnableLUA")),
         "uacPrompt": _uac_prompt(),
-        "defaultBrowser": _default_browser(),
         "bootTime": boot_time or UNAVAILABLE,
         "uptime": format_duration(uptime) if uptime is not None else UNAVAILABLE,
         "uptimeSeconds": uptime,
@@ -550,98 +533,6 @@ def _uac_prompt() -> str:
     return UNAVAILABLE
 
 
-def _default_browser() -> str:
-    """Resolve the default browser ProgId and its executable base name.
-
-    Only the registered ProgId and the program file name are read. No
-    cookies, sessions, or stored credentials are touched.
-    """
-    prog_id = registry_value("HKEY_CURRENT_USER", _BROWSER_KEY, "ProgId")
-    if not isinstance(prog_id, str) or prog_id.strip() == "":
-        return UNAVAILABLE
-    prog_id = prog_id.strip()
-    command = registry_value("HKEY_CLASSES_ROOT", f"{prog_id}\\shell\\open\\command", "")
-    if not isinstance(command, str) or command.strip() == "":
-        return prog_id
-    executable = _command_executable(command)
-    return f"{prog_id} ({Path(executable).name})" if executable else prog_id
-
-
-def _command_executable(command: str) -> str:
-    """Extract the executable path from a shell open command line.
-
-    Handles both the quoted form Windows uses for paths with spaces and
-    the bare form, and returns an empty string when nothing parses.
-    """
-    text = command.strip()
-    if text.startswith('"'):
-        end = text.find('"', 1)
-        return text[1:end] if end > 0 else ""
-    return text.split(" ")[0]
-
-
-# ---------------------------------------------------------------------------
-# Installed software (registry uninstall keys only)
-# ---------------------------------------------------------------------------
-
-_SOFTWARE_KEYS = (
-    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-    ("HKEY_CURRENT_USER", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-)
-
-
-def collect_software(limit: int | None = None) -> dict:
-    """List installed applications from the uninstall registry keys.
-
-    Reads DisplayName, DisplayVersion, and Publisher only. License keys
-    and install paths are not touched. Duplicate display names across
-    hives are collapsed, never dropped arbitrarily.
-    """
-    items: list[dict] = []
-    seen: set[str] = set()
-    for root_name, path in _SOFTWARE_KEYS:
-        for subkey in registry_subkeys(root_name, path):
-            base = f"{path}\\{subkey}"
-            name = registry_value(root_name, base, "DisplayName")
-            if not isinstance(name, str) or name.strip() == "":
-                continue
-            if registry_value(root_name, base, "SystemComponent"):
-                continue
-            cleaned = name.strip()
-            key = cleaned.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append({
-                "name": cleaned,
-                "version": format_text(registry_value(root_name, base, "DisplayVersion")),
-                "publisher": format_text(registry_value(root_name, base, "Publisher")),
-            })
-    items.sort(key=lambda item: item["name"].lower())
-    if limit is not None and limit > 0:
-        items = items[:limit]
-    return {"count": len(items), "items": items}
-
-
-def collect_start_menu_count(dirs=None, discover=None) -> dict:
-    """Count Start Menu applications using the existing apps catalog."""
-    try:
-        if discover is None:
-            from astral_relay.agent.windows.apps import discover_catalog as discover
-        catalog = discover(dirs) if dirs is not None else discover()
-    except Exception:  # noqa: BLE001 - catalog failure only marks the count Unavailable
-        return {"count": None, "available": None, "skipped": None}
-    apps = catalog.get("apps") if isinstance(catalog, dict) else None
-    if not isinstance(apps, list):
-        return {"count": None, "available": None, "skipped": None}
-    return {
-        "count": len(apps),
-        "available": sum(1 for entry in apps if entry.get("available")),
-        "skipped": catalog.get("skipped"),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Section builders
 # ---------------------------------------------------------------------------
@@ -680,8 +571,6 @@ def _entries(ps: dict, key: str) -> list:
 
 _DRIVE_TYPES = {0: "Unknown", 1: "No root directory", 2: "Removable", 3: "Local disk", 4: "Network", 5: "CD-ROM", 6: "RAM disk"}
 _PROCESSOR_ARCH = {0: "x86", 1: "MIPS", 2: "Alpha", 3: "PowerPC", 5: "ARM", 6: "IA64", 9: "x64", 12: "ARM64"}
-_SERVICE_STATUS = {1: "Stopped", 2: "Start pending", 3: "Stop pending", 4: "Running", 5: "Continue pending", 6: "Pause pending", 7: "Paused"}
-_SERVICE_START = {0: "Boot", 1: "System", 2: "Automatic", 3: "Manual", 4: "Disabled"}
 
 
 def build_os_section(local: dict, ps: dict) -> dict:
@@ -898,11 +787,15 @@ def build_graphics_section(ps: dict) -> list[dict]:
 
 
 def build_board_section(local: dict, ps: dict) -> dict:
-    """Collect motherboard, BIOS, and platform-security facts."""
+    """Collect system, motherboard, BIOS, and platform-security facts."""
     board = _entry(ps, "board") or {}
     bios = _entry(ps, "bios") or {}
     tpm = _entry(ps, "tpm") or {}
+    computer = _entry(ps, "computer") or {}
     return {
+        "systemManufacturer": _pick(computer.get("Manufacturer"), local.get("systemManufacturer")),
+        "systemModel": _pick(computer.get("Model"), local.get("systemProduct")),
+        "systemType": format_text(computer.get("SystemType")),
         "boardManufacturer": _pick(board.get("Manufacturer"), local.get("baseBoardManufacturer")),
         "boardModel": _pick(board.get("Product"), local.get("baseBoardProduct")),
         "boardVersion": format_text(board.get("Version")),
@@ -929,12 +822,17 @@ def build_storage_section(ps: dict) -> dict:
         logical.append({
             "device": format_text(drive.get("DeviceID")),
             "type": _DRIVE_TYPES.get(drive_type, UNAVAILABLE),
+            "driveType": drive_type,
             "fileSystem": format_text(drive.get("FileSystem")),
             "label": format_text(drive.get("FileSystemLabel")),
             "total": format_bytes(size),
             "used": format_bytes(used),
             "free": format_bytes(free),
             "usedPercent": format_percent(percent) if percent is not None else UNAVAILABLE,
+            # Kept as a number as well as a display string so the Overview
+            # can classify a drive as High or Critical without re-parsing text.
+            "percentValue": percent,
+            "fixed": drive_type == _FIXED_DRIVE_TYPE,
         })
     health = {str(item.get("FriendlyName", "")): item for item in _entries(ps, "diskHealth")}
     physical = []
@@ -964,7 +862,17 @@ def build_storage_section(ps: dict) -> dict:
             "percent": f"{percent}%" if percent is not None else UNAVAILABLE,
             "protected": _int_or_none(volume.get("ProtectionStatus")) == 1,
         })
-    return {"logical": logical, "physical": physical, "bitlocker": bitlocker}
+    return {
+        "logical": logical,
+        "physical": physical,
+        "bitlocker": bitlocker,
+    }
+
+
+# DriveType 3 is a fixed local disk. The Overview summarizes fixed volumes
+# one by one and groups removable, network, and optical volumes into a single
+# line; the Storage message lists the full detail for every volume.
+_FIXED_DRIVE_TYPE = 3
 
 
 _BITLOCKER_VOLUME_STATUS = {
@@ -1165,10 +1073,10 @@ def build_security_section(local: dict, ps: dict, board: dict, storage: dict) ->
         stamp = str(entry.get("InstalledOn") or "")
         if stamp and (newest is None or stamp > newest[0]):
             newest = (stamp, entry)
-    firewall_text = ", ".join(
-        f"{format_text(item.get('Name'))}: {_flag_text(item.get('Enabled'))}"
+    firewall_profiles = [
+        {"profile": format_text(item.get("Name")), "state": _flag_text(item.get("Enabled"))}
         for item in firewall
-    )
+    ]
     protection = storage.get("bitlocker") or []
     protected = [item for item in protection if item.get("protected")]
     return {
@@ -1176,7 +1084,7 @@ def build_security_section(local: dict, ps: dict, board: dict, storage: dict) ->
         "realTimeProtection": format_flag(defender.get("RealTimeProtectionEnabled")) if defender else UNAVAILABLE,
         "defenderSignature": format_text(defender.get("AntivirusSignatureVersion")),
         "defenderSignatureDate": format_moment(defender.get("AntivirusSignatureLastUpdated")),
-        "firewallStatus": firewall_text or UNAVAILABLE,
+        "firewallProfiles": firewall_profiles,
         "lastUpdate": f"{newest[1].get('HotFixID')} ({format_moment(newest[0])})" if newest else UNAVAILABLE,
         "hotfixCount": str(len(hotfixes)) if hotfixes else UNAVAILABLE,
         "pendingUpdates": NOT_SUPPORTED,
@@ -1236,72 +1144,6 @@ def _tpm_summary(board: dict) -> str:
     return f"{present} (spec {version})" if version != UNAVAILABLE else present
 
 
-def build_process_section(ps: dict, limit: int = 10) -> dict:
-    """Collect running-process counts and the top CPU and memory users.
-
-    Only process names, PIDs, CPU time, and working-set sizes are read.
-    Command lines, environment values, and memory contents are never touched.
-    """
-    processes = []
-    for entry in _entries(ps, "processes"):
-        pid = _int_or_none(entry.get("Id"))
-        if pid is None:
-            continue
-        cpu = entry.get("CPU")
-        processes.append({
-            "name": format_text(entry.get("ProcessName")),
-            "pid": str(pid),
-            "cpuSeconds": float(cpu) if isinstance(cpu, (int, float)) else None,
-            "memoryBytes": _int_or_none(entry.get("WorkingSet64")),
-        })
-    by_cpu = sorted(
-        (item for item in processes if item["cpuSeconds"] is not None),
-        key=lambda item: item["cpuSeconds"],
-        reverse=True,
-    )[:limit]
-    by_memory = sorted(
-        (item for item in processes if item["memoryBytes"] is not None),
-        key=lambda item: item["memoryBytes"],
-        reverse=True,
-    )[:limit]
-    return {
-        "count": len(processes),
-        "items": sorted(processes, key=lambda item: (item["name"].lower(), item["pid"])),
-        "topCpu": [
-            {"name": item["name"], "pid": item["pid"], "value": f"{item['cpuSeconds']:.1f} s CPU time"}
-            for item in by_cpu
-        ],
-        "topMemory": [
-            {"name": item["name"], "pid": item["pid"], "value": format_bytes(item["memoryBytes"])}
-            for item in by_memory
-        ],
-    }
-
-
-def build_service_section(ps: dict) -> dict:
-    """Collect service counts and every service name with its state."""
-    items = []
-    for entry in _entries(ps, "services"):
-        name = entry.get("Name")
-        if not isinstance(name, str) or name.strip() == "":
-            continue
-        status = _int_or_none(entry.get("Status"))
-        start = _int_or_none(entry.get("StartType"))
-        items.append({
-            "name": name.strip(),
-            "display": format_text(entry.get("DisplayName")),
-            "status": _SERVICE_STATUS.get(status, UNAVAILABLE),
-            "startType": _SERVICE_START.get(start, UNAVAILABLE),
-        })
-    running = sum(1 for item in items if item["status"] == "Running")
-    return {
-        "total": len(items),
-        "running": running,
-        "stopped": sum(1 for item in items if item["status"] == "Stopped"),
-        "items": items,
-    }
-
-
 def build_performance_section(ps: dict, cpu: float | None, memory: dict | None, window_ms: int | None,
                               now=None) -> dict:
     """Collect instantaneous performance counters and the sampling window."""
@@ -1334,22 +1176,18 @@ def build_performance_section(ps: dict, cpu: float | None, memory: dict | None, 
     }
 
 
-def build_environment_section(local: dict, os_section: dict, software_section: dict, state_directory,
-                              log_path) -> dict:
-    """Collect directory and environment availability facts.
+def build_environment_section(state_directory, log_path) -> dict:
+    """Collect agent state-directory availability facts.
 
-    Only directory availability is reported; environment variable values
-    are never echoed, so no secrets or private paths can leak.
+    Only directory availability is reported; environment variable values are
+    never echoed, so no secrets or private paths can leak. The Windows and
+    system directories are collected once, by the OS section, and are not
+    repeated here.
     """
     return {
-        "windowsDirectory": os_section.get("windowsDirectory", UNAVAILABLE),
-        "systemDirectory": os_section.get("systemDirectory", UNAVAILABLE),
-        "bootDevice": os_section.get("bootDevice", UNAVAILABLE),
-        "firmwareArchitecture": os_section.get("firmwareArchitecture", UNAVAILABLE),
         "environmentStatus": "Collected (values withheld)",
         "stateDirectory": directory_availability(state_directory),
         "diagnosticLog": directory_availability(log_path),
-        "softwareStatus": software_section.get("status", UNAVAILABLE),
     }
 
 
@@ -1390,7 +1228,6 @@ def _agent_facts(agent: dict | None, env=None) -> dict:
 
     facts = dict(agent or {})
     facts.setdefault("agentVersion", str(AGENT_VERSION))
-    facts.setdefault("pid", os.getpid())
     if not isinstance(facts.get("registration"), dict):
         from astral_relay.agent.startup import read_registration
 
@@ -1431,23 +1268,21 @@ def _log_text(summary: dict) -> str:
 
 
 def build_identity_section(local: dict, ps: dict, facts: dict, public_ip, now) -> dict:
-    """Collect the PC identification block shown at the top of the report."""
-    computer = _entry(ps, "computer") or {}
+    """Collect the PC identification summary used by the report header.
+
+    The detailed hardware facts live in their own sections; this dict
+    only carries what the header shows, so nothing is duplicated.
+    """
     os_info = _entry(ps, "os") or {}
     return {
         "hostname": format_text(facts.get("hostname")),
         "installationId": format_text(facts.get("installationId")),
         "localIpv4": format_text(facts.get("localIpv4")),
         "publicIpv4": format_text(public_ip),
-        "manufacturer": _pick(computer.get("Manufacturer"), local.get("systemManufacturer")),
-        "model": _pick(computer.get("Model"), local.get("systemProduct")),
-        "systemType": format_text(computer.get("SystemType")),
         "osName": _pick(os_info.get("Caption"), local.get("osName")),
         "osVersion": _os_version_text(os_info, local),
         "agentStatus": "ONLINE" if facts.get("connected") else "UNKNOWN",
         "agentVersion": format_text(facts.get("agentVersion")),
-        "bootTime": local.get("bootTime", UNAVAILABLE),
-        "uptime": local.get("uptime", UNAVAILABLE),
         "lastUpdated": _now(now).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1468,12 +1303,10 @@ def _os_version_text(os_info: dict, local: dict) -> str:
 def build_agent_section(facts: dict) -> dict:
     """Collect Astral Relay agent facts, including read-only install state."""
     registration = facts.get("registration") or {}
-    commands = facts.get("enabledCommands")
     return {
         "version": format_text(facts.get("agentVersion")),
         "installationId": format_text(facts.get("installationId")),
         "uptime": format_duration(facts.get("uptimeSeconds")),
-        "pid": str(facts.get("pid")) if facts.get("pid") else UNAVAILABLE,
         "connection": format_text(
             facts.get("connection") or ("Connected" if facts.get("connected") else None)
         ),
@@ -1482,11 +1315,10 @@ def build_agent_section(facts: dict) -> dict:
             str(facts.get("reconnects")) if isinstance(facts.get("reconnects"), int) else UNAVAILABLE
         ),
         "lastUpdate": NOT_SUPPORTED,
-        "commands": (
-            ", ".join(str(item) for item in commands)
-            if isinstance(commands, list) and commands else UNAVAILABLE
-        ),
-        "permission": format_text(facts.get("requiredPermission")),
+        # The agent exposes no prefix commands, so no Discord permission is
+        # required to drive it; the report states that instead of naming a
+        # permission that nothing enforces.
+        "requiredPermission": f"{NOT_APPLICABLE} (agent exposes no commands)",
         "categoryStatus": format_text(facts.get("categoryStatus")),
         "channelCount": (
             str(facts.get("channelCount")) if isinstance(facts.get("channelCount"), int) else UNAVAILABLE
@@ -1495,23 +1327,6 @@ def build_agent_section(facts: dict) -> dict:
         "startupRegistration": _registration_text(registration),
         "backupExecutable": _backup_text(registration),
         "logSummary": _log_text(facts.get("logSummary") or {}),
-    }
-
-
-def build_software_section(software: dict, start_menu: dict, local: dict) -> dict:
-    """Collect the installed-application inventory and catalog counts."""
-    count = software.get("count")
-    return {
-        "count": str(count) if isinstance(count, int) else UNAVAILABLE,
-        "items": software.get("items") or [],
-        "startMenuCount": (
-            str(start_menu.get("count")) if isinstance(start_menu.get("count"), int) else UNAVAILABLE
-        ),
-        "startMenuAvailable": (
-            str(start_menu.get("available")) if isinstance(start_menu.get("available"), int) else UNAVAILABLE
-        ),
-        "defaultBrowser": local.get("defaultBrowser", UNAVAILABLE),
-        "status": "Collected" if count else UNAVAILABLE,
     }
 
 
@@ -1532,13 +1347,10 @@ def collect(agent: dict | None = None, *, ps_data=None, runner=None, env=None, n
     utilization = read_cpu_utilization()
     public_ip = read_public_ipv4()
     connectivity = _reachable() if public_ip is None else True
-    software = collect_software()
-    start_menu = collect_start_menu_count()
     facts = _agent_facts(agent, env)
     board = build_board_section(local, ps)
     storage = build_storage_section(ps)
     os_section = build_os_section(local, ps)
-    software_section = build_software_section(software, start_menu, local)
     state_directory, log_path = _state_paths(env)
     return {
         "identity": build_identity_section(local, ps, facts, public_ip, moment),
@@ -1551,12 +1363,9 @@ def collect(agent: dict | None = None, *, ps_data=None, runner=None, env=None, n
         "network": build_network_section(ps, public_ip, connectivity, facts),
         "power": build_power_section(ps, power),
         "security": build_security_section(local, ps, board, storage),
-        "software": software_section,
-        "processes": build_process_section(ps),
-        "services": build_service_section(ps),
         "performance": build_performance_section(
             ps, utilization, memory, int(CPU_SAMPLE_SECONDS * 1000), moment
         ),
-        "environment": build_environment_section(local, os_section, software_section, state_directory, log_path),
+        "environment": build_environment_section(state_directory, log_path),
         "agent": build_agent_section(facts),
     }

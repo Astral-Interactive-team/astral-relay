@@ -22,7 +22,7 @@ def test_codegen_module_loads_through_import(tmp_path, monkeypatch):
 
     module = importlib.import_module("_embedded_payload")
     assert module.TOKEN == TOKEN_A
-    assert module.CONFIG["requiredPermission"] == "ManageGuild"
+    assert module.CONFIG["startupName"] == "AstralRelay"
 
 
 def test_cli_version_smoke():

@@ -19,8 +19,6 @@ AGENT = {
     "latencySeconds": 0.042,
     "reconnects": 0,
     "uptimeSeconds": 3725,
-    "enabledCommands": ["status", "open", "apps", "lock"],
-    "requiredPermission": "ManageGuild",
     "categoryStatus": "Created new category (id 1)",
     "channelCount": 1,
     "registration": {
@@ -183,14 +181,6 @@ PS = {
         {"HotFixID": "KB5034441", "InstalledOn": "2024-01-10"},
         {"HotFixID": "KB5034765", "InstalledOn": "2024-02-14"},
     ],
-    "services": [
-        {"Name": "Spooler", "DisplayName": "Print Spooler", "Status": 4, "StartType": 2},
-        {"Name": "W32Time", "DisplayName": "Windows Time", "Status": 1, "StartType": 3},
-    ],
-    "processes": [
-        {"Id": 4, "ProcessName": "System", "CPU": 12.5, "WorkingSet64": 1048576},
-        {"Id": 100, "ProcessName": "explorer", "CPU": 2.0, "WorkingSet64": 268435456},
-    ],
     "diskPerf": [
         {"Name": "_Total", "DiskReadBytesPerSec": 1048576, "DiskWriteBytesPerSec": 524288, "PercentDiskTime": 7}
     ],
@@ -220,18 +210,6 @@ def stub_probes(monkeypatch):
         "batteryPercent": 255,
         "batterySeconds": 0,
     })
-    monkeypatch.setattr(inv, "collect_software", lambda limit=None: {
-        "count": 2,
-        "items": [
-            {"name": "App A", "version": "1.0", "publisher": "Vendor"},
-            {"name": "App B", "version": "2.0", "publisher": "Vendor"},
-        ],
-    })
-    monkeypatch.setattr(inv, "collect_start_menu_count", lambda *args, **kwargs: {
-        "count": 7,
-        "available": 6,
-        "skipped": 1,
-    })
     return inv
 
 
@@ -245,9 +223,12 @@ def test_collect_returns_every_section(stub_probes):
     data = collect()
     assert set(data) == {
         "identity", "os", "cpu", "memory", "graphics", "board", "storage", "network",
-        "power", "security", "software", "processes", "services", "performance",
-        "environment", "agent",
+        "power", "security", "performance", "environment", "agent",
     }
+    # Process, service, and installed-software inventories are not collected.
+    assert "processes" not in data
+    assert "services" not in data
+    assert "software" not in data
 
 
 def test_identity_prefers_injected_agent_facts(stub_probes):
@@ -256,12 +237,13 @@ def test_identity_prefers_injected_agent_facts(stub_probes):
     assert identity["installationId"] == "0123456789abcdef"
     assert identity["agentStatus"] == "ONLINE"
     assert identity["agentVersion"] == "0.1.0"
-    assert identity["manufacturer"] == "Contoso"
-    assert identity["model"] == "Workstation 9000"
-    assert identity["systemType"] == "x64-based PC"
     assert identity["osName"] == "Microsoft Windows 11 Pro"
     assert identity["osVersion"].startswith("10.0.22631")
     assert identity["lastUpdated"] == "2026-03-04 05:06:07"
+    # The header carries only identity plus headline numbers, so the
+    # hardware facts that used to live here are not duplicated.
+    assert "manufacturer" not in identity
+    assert "pid" not in identity
 
 
 def test_offline_agent_reports_unknown_status(stub_probes):
@@ -341,6 +323,8 @@ def test_storage_section_translates_enums(stub_probes):
     assert volume["type"] == "Local disk"
     assert volume["label"] == "System"
     assert volume["usedPercent"].startswith("50")
+    assert volume["fixed"] is True
+    assert 49.0 < volume["percentValue"] < 51.0
     disk = storage["physical"][0]
     assert disk["model"] == "Contoso NVMe SSD"
     assert disk["mediaType"] == "SSD"
@@ -355,6 +339,19 @@ def test_storage_section_translates_enums(stub_probes):
     assert encrypted["percent"] == "100%" and encrypted["protected"] is True
     assert (plain["status"], plain["protection"], plain["encryption"]) == ("Fully decrypted", "Off", "None")
     assert plain["protected"] is False
+    # The removed headline summary is not rebuilt anywhere; the Overview reads
+    # the volume numbers straight from the section instead.
+    assert "summary" not in storage
+
+
+def test_removable_volumes_are_not_flagged_fixed(stub_probes):
+    storage = collect(ps=dict(PS, logicalDisks=[
+        {"DeviceID": "C:", "DriveType": 3, "FileSystem": "NTFS", "FileSystemLabel": "System",
+         "Size": 500107862016, "FreeSpace": 250053931008},
+        {"DeviceID": "D:", "DriveType": 2, "FileSystem": "FAT32", "FileSystemLabel": "",
+         "Size": 32000000000, "FreeSpace": 16000000000},
+    ]))["storage"]
+    assert [drive["fixed"] for drive in storage["logical"]] == [True, False]
 
 
 def test_network_section_lists_adapters_up_first(stub_probes):
@@ -410,32 +407,16 @@ def test_security_section_summarizes_defender_and_updates(stub_probes):
     assert security["realTimeProtection"] == "Yes"
     assert security["defenderSignature"] == "1.400.1"
     assert security["defenderSignatureDate"] == "2026-01-02 03:04:05"
-    assert security["firewallStatus"] == "Domain: On, Public: Off"
+    assert security["firewallProfiles"] == [
+        {"profile": "Domain", "state": "On"},
+        {"profile": "Public", "state": "Off"},
+    ]
     assert security["lastUpdate"] == "KB5034765 (2024-02-14)"
     assert security["hotfixCount"] == "2"
     assert security["pendingUpdates"] == inv.NOT_SUPPORTED
     assert security["secureBoot"] == "Yes"
     assert security["tpmStatus"] == "Yes (spec 2.0)"
     assert security["bitlockerStatus"] == "1/2 volumes protected"
-
-
-def test_process_section_lists_all_and_ranks_users(stub_probes):
-    processes = collect()["processes"]
-    assert processes["count"] == 2
-    assert [item["name"] for item in processes["items"]] == ["explorer", "System"]
-    assert processes["items"][1]["pid"] == "4"
-    assert processes["topCpu"][0]["name"] == "System"
-    assert processes["topCpu"][0]["value"] == "12.5 s CPU time"
-    assert processes["topMemory"][0]["name"] == "explorer"
-    assert processes["topMemory"][0]["value"] == "256.0 MB"
-
-
-def test_service_section_counts_states(stub_probes):
-    services = collect()["services"]
-    assert (services["total"], services["running"], services["stopped"]) == (2, 1, 1)
-    spooler = services["items"][0]
-    assert spooler["display"] == "Print Spooler"
-    assert (spooler["status"], spooler["startType"]) == ("Running", "Automatic")
 
 
 def test_performance_section_renders_counters(stub_probes):
@@ -451,13 +432,13 @@ def test_performance_section_renders_counters(stub_probes):
     assert performance["sampleTimestamp"] == "2026-03-04 05:06:07"
 
 
-def test_software_section_lists_every_application(stub_probes):
-    software = collect()["software"]
-    assert software["count"] == "2"
-    assert [item["name"] for item in software["items"]] == ["App A", "App B"]
-    assert software["startMenuCount"] == "7"
-    assert software["startMenuAvailable"] == "6"
-    assert software["status"] == "Collected"
+def test_board_section_keeps_system_and_motherboard_facts(stub_probes):
+    board = collect()["board"]
+    assert board["systemManufacturer"] == "Contoso"
+    assert board["systemModel"] == "Workstation 9000"
+    assert board["systemType"] == "x64-based PC"
+    assert board["boardManufacturer"] == "Contoso"
+    assert board["boardModel"] == "X570-A"
 
 
 def test_agent_section_reports_version_and_registration(stub_probes):
@@ -465,12 +446,16 @@ def test_agent_section_reports_version_and_registration(stub_probes):
     assert agent["version"] == "0.1.0"
     assert agent["installationId"] == "0123456789abcdef"
     assert agent["uptime"] == "1h 2m 5s"
+    # The Agent process ID is no longer collected or reported.
+    assert "pid" not in agent
     assert agent["connection"] == "Connected"
     assert agent["latency"] == "42 ms"
     assert agent["reconnectCount"] == "0"
     assert agent["lastUpdate"] == inv.NOT_SUPPORTED
-    assert agent["commands"] == "status, open, apps, lock"
-    assert agent["permission"] == "ManageGuild"
+    # The agent exposes no Discord commands, so the report states that no
+    # management permission is required instead of naming one.
+    assert "commands" not in agent
+    assert agent["requiredPermission"] == "N/A (agent exposes no commands)"
     assert agent["categoryStatus"] == "Created new category (id 1)"
     assert agent["channelCount"] == "1"
     assert agent["duplicateWarning"] == "None detected"
@@ -492,7 +477,13 @@ def test_environment_section_withholds_values(stub_probes, tmp_path):
     assert environment["environmentStatus"] == "Collected (values withheld)"
     assert environment["stateDirectory"] == "Available"
     assert environment["diagnosticLog"] == "Not created yet"
-    assert environment["softwareStatus"] == "Collected"
+    # The Windows and system directories are reported once, by the OS
+    # section, and are not duplicated here.
+    assert "windowsDirectory" not in environment
+    assert "systemDirectory" not in environment
+    assert "bootDevice" not in environment
+    assert "firmwareArchitecture" not in environment
+    assert "softwareStatus" not in environment
     assert data["agent"]["logSummary"] == (
         "3 entries (2 warnings, 1 fatal); last 2026-01-01T00:00:00+00:00"
     )
@@ -505,8 +496,7 @@ def test_missing_cim_data_degrades_to_unavailable(stub_probes):
     assert data["storage"]["bitlocker"] == []
     assert data["graphics"] == []
     assert data["network"]["adapters"] == []
-    assert data["processes"]["count"] == 0
-    assert data["services"]["total"] == 0
+    assert data["security"]["firewallProfiles"] == []
     assert data["security"]["hotfixCount"] == inv.UNAVAILABLE
     assert data["security"]["defenderStatus"] == inv.UNAVAILABLE
     assert data["board"]["tpmPresent"] == inv.UNAVAILABLE
@@ -549,10 +539,35 @@ def test_first_available_value_skips_the_unavailable_marker():
     assert inv._pick(7, inv.UNAVAILABLE) == "7"
 
 
-def test_command_executable_handles_quoted_paths():
-    assert inv._command_executable('"C:\\Program Files\\App\\app.exe" --flag') == "C:\\Program Files\\App\\app.exe"
-    assert inv._command_executable("C:\\App\\app.exe %1") == "C:\\App\\app.exe"
-    assert inv._command_executable('"unterminated') == ""
+def test_removed_process_service_and_software_helpers_are_gone():
+    assert not hasattr(inv, "_command_executable")
+    assert not hasattr(inv, "_default_browser")
+    assert not hasattr(inv, "collect_software")
+    assert not hasattr(inv, "collect_start_menu_count")
+    assert not hasattr(inv, "build_process_section")
+    assert not hasattr(inv, "build_service_section")
+    assert not hasattr(inv, "build_software_section")
+
+
+def test_powershell_child_runs_without_a_console_window(monkeypatch):
+    """A --noconsole agent must never flash a console for its children."""
+    from astral_relay.shared import winproc
+
+    captured = {}
+
+    class _Proc:
+        stdout = base64.b64encode(b"{}")
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return _Proc()
+
+    monkeypatch.setattr(inv.subprocess, "run", fake_run)
+    assert inv.run_powershell_json("Write-Output 'x'") == {}
+    assert winproc.CREATE_NO_WINDOW
+    assert captured["creationflags"] & winproc.CREATE_NO_WINDOW
+    assert captured["shell"] is False
+    assert captured["capture_output"] is True
 
 
 def test_directory_availability_never_creates_anything(tmp_path):

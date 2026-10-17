@@ -1,17 +1,26 @@
 # Components V2 rendering and publication for the managed #info dashboard.
 # The collector in windows/inventory.py returns display-ready facts; this
-# module is the presentation half: it turns one inventory into ordered
-# sections, packs them into as few Discord messages as the platform
-# limits allow, and republishes them into the existing per-computer
-# #info channel. Nothing here collects data and nothing here decides what
-# is available, so the two halves stay independently testable.
-# Message limits (4000 display characters and 40 components per message)
-# are enforced before every send, and a failing part is logged instead of
-# being recorded as published. Each section starts with a Markdown
-# heading behind a separator, and a section that outgrows one message
-# repeats its heading with a (continued) marker so a reader never loses
-# context. No embeds are used: every title, body, and divider is a V2
-# component.
+# module is the presentation half. It turns one inventory into a fixed,
+# ordered set of message groups ("Overview", "Windows & Operating System",
+# ...), packs those groups into Discord messages, and republishes them into
+# the existing per-computer #info channel.
+# Visual hierarchy, largest to smallest:
+#   #  Astral Relay — System Information (Part N of M)   message title
+#   ## <group>                                          message topic
+#   ### <section>                                       topic section
+#   **Label:** value / **Item n: name** / - bullet       detail lines
+# Discord exposes only three heading levels, so individual GPUs, memory
+# modules, and network adapters use bold item headers instead of a fourth
+# level. Every message always opens with its title and its group heading, so
+# a reader can identify a message without scrolling.
+# A group always starts its own message; a group that outgrows one message
+# continues in additional messages, where the same group heading is printed
+# again without any continuation marker. No select menu, button, or other
+# interactive control is ever added.
+# Message limits (4000 display characters and 40 components per message) are
+# enforced before every send, and a failing part is logged instead of being
+# recorded as published. No embeds are used: every title, body, and divider
+# is a V2 component.
 
 from __future__ import annotations
 
@@ -23,32 +32,86 @@ from astral_relay.shared.logging_utils import warn
 TITLE = "Astral Relay — System Information"
 ACCENT_COLOUR = 0x6C5CE7
 
-# Discord limits: 4000 display characters and 40 components per message.
-# The published budgets leave a safety margin so a late change can never
-# push a real message over the platform limit.
+# Message group order. The first group is always the Overview dashboard and
+# every later group is one topical message.
+GROUP_OVERVIEW = "Overview"
+GROUP_WINDOWS = "Windows & Operating System"
+GROUP_COMPUTE = "Processor & Memory"
+GROUP_GRAPHICS = "Graphics & Firmware"
+GROUP_STORAGE = "Storage"
+GROUP_NETWORK = "Network & Power"
+GROUP_SECURITY = "Security & Updates"
+GROUP_AGENT = "Performance & Agent"
+GROUPS = (
+    GROUP_OVERVIEW,
+    GROUP_WINDOWS,
+    GROUP_COMPUTE,
+    GROUP_GRAPHICS,
+    GROUP_STORAGE,
+    GROUP_NETWORK,
+    GROUP_SECURITY,
+    GROUP_AGENT,
+)
+
+# Utilization thresholds. A metric at or above the warning threshold is
+# annotated with text and raises the container accent colour, so the same
+# fact is carried by colour and by words; nothing is ever signalled by
+# colour alone.
+WARN_PERCENT = 80.0
+CRITICAL_PERCENT = 90.0
+_LEVEL_RANK = {None: 0, "warning": 1, "critical": 2}
+LEVEL_COLOURS = {"warning": 0xE67E22, "critical": 0xE74C3C}
+
+# Discord limits: 4000 display characters and 40 components per message. The
+# container itself counts as one component, and the published budgets leave a
+# safety margin so a late change can never push a real message over the limit.
 MAX_TEXT_LENGTH = 4000
 MAX_COMPONENTS = 40
 TEXT_BUDGET = 3800
-COMPONENT_BUDGET = 39
+COMPONENT_BUDGET = MAX_COMPONENTS - 1
 
 # Longest body text one TextDisplay holds before the section is chunked.
 SECTION_CHUNK = 1700
+
+# Room held back on every page for the message title and the group heading.
+# Both are added at view-build time, after packing.
+PAGE_RESERVE_TEXT = 160
+PAGE_RESERVE_COMPONENTS = 4
 
 
 @dataclass(frozen=True)
 class Block:
     """One TextDisplay of the report.
 
-    `heading` marks a block that opens a section, so a separator is
-    drawn above it when it does not already start a message.
+    `group` names the message group this block belongs to, so packing can
+    start a new message at every group boundary, and every message can print
+    its topic heading. `heading` marks a block that opens a section,
+    `continuation` marks a body that carries on a section started earlier, and
+    `section` names that section. Continuation is never re-labelled when it is
+    rendered: the message title already carries the position. `level` marks a
+    block that carries an attention-worthy measurement.
     """
 
     text: str
+    group: str = ""
     heading: bool = False
+    continuation: bool = False
+    section: str | None = None
+    level: str | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class Topic:
+    """One report section: a group, a section title, and its display lines."""
+
+    group: str
+    title: str
+    lines: list[str]
+    level: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Section bodies
+# Small formatting helpers
 # ---------------------------------------------------------------------------
 
 
@@ -59,61 +122,226 @@ def _field(label: str, value) -> str:
     return f"**{label}:** {value}"
 
 
-def _identity_lines(identity: dict) -> list[str]:
-    """Render the PC identification block shown first in the report."""
+def _plain(value) -> str:
+    """Render a value inside a bold item header without nested markdown."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return UNAVAILABLE
+    return str(value)
+
+
+def _number(text):
+    """Parse a display percentage such as `45.0%` back into a float."""
+    if isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    if not isinstance(text, str):
+        return None
+    try:
+        return float(text.strip().rstrip("%").strip())
+    except ValueError:
+        return None
+
+
+def _usage_level(percent):
+    """Classify a utilization percentage into None, warning, or critical."""
+    if percent is None:
+        return None
+    if percent >= CRITICAL_PERCENT:
+        return "critical"
+    if percent >= WARN_PERCENT:
+        return "warning"
+    return None
+
+
+def _worst_level(*levels):
+    """Return the highest severity among the given levels."""
+    return max(levels, key=lambda level: _LEVEL_RANK.get(level, 0))
+
+
+def _level_suffix(percent) -> str:
+    """Annotate a measurement in words when it runs high."""
+    level = _usage_level(percent)
+    if level == "critical":
+        return " - Critical"
+    if level == "warning":
+        return " - High"
+    return ""
+
+
+def _memory_usage_text(memory: dict) -> str:
+    """Compose the memory summary as `45.0% (8.0 GB of 16.0 GB)`."""
+    percent = memory.get("usagePercent")
+    used = memory.get("usedPhysical")
+    total = memory.get("totalPhysical")
+    if percent is None and used is None:
+        return UNAVAILABLE
+    if percent is None:
+        return f"{used} of {total}" if used is not None and total is not None else UNAVAILABLE
+    if used is not None and total is not None:
+        return f"{percent} ({used} of {total})"
+    return str(percent)
+
+
+def _inferred(value) -> str:
+    """Mark a locally inferred fact so it is not read as a measured one."""
+    text = _plain(value)
+    return text if text == UNAVAILABLE else f"{text} (inferred)"
+
+
+def _device(value) -> str:
+    """Render a drive letter or mount point without its trailing separator."""
+    text = _plain(value)
+    if text == UNAVAILABLE:
+        return text
+    return text.strip().rstrip(":\\")
+
+
+# ---------------------------------------------------------------------------
+# Message 1 — Overview
+# ---------------------------------------------------------------------------
+
+
+def _overview_topics(inventory: dict) -> list[Topic]:
+    """Build the Overview dashboard: identity, status, and headline numbers."""
+    identity = inventory.get("identity") or {}
+    cpu = inventory.get("cpu") or {}
+    memory = inventory.get("memory") or {}
+    storage = inventory.get("storage") or {}
+
+    cpu_percent = _number(cpu.get("utilization"))
+    memory_percent = _number(memory.get("usagePercent"))
+    utilization = [
+        _field("CPU utilization", f"{_plain(cpu.get('utilization'))}{_level_suffix(cpu_percent)}"),
+        _field(
+            "Memory usage",
+            f"{_memory_usage_text(memory)}{_level_suffix(memory_percent)}",
+        ),
+    ]
+    storage_lines, storage_level = _overview_storage(storage)
+
     return [
-        _field("Hostname", identity.get("hostname")),
-        _field("Installation ID", identity.get("installationId")),
-        _field("Local IPv4", identity.get("localIpv4")),
-        _field("Public IPv4", identity.get("publicIpv4")),
-        _field("Manufacturer", identity.get("manufacturer")),
-        _field("Model", identity.get("model")),
-        _field("System type", identity.get("systemType")),
-        _field("Operating system", identity.get("osName")),
-        _field("OS version / build", identity.get("osVersion")),
-        _field("Agent status", identity.get("agentStatus")),
-        _field("Agent version", identity.get("agentVersion")),
-        _field("System boot time", identity.get("bootTime")),
-        _field("System uptime", identity.get("uptime")),
-        _field("Last updated", identity.get("lastUpdated")),
+        Topic(GROUP_OVERVIEW, "Machine", [
+            _field("Hostname", identity.get("hostname")),
+            _field("Installation ID", identity.get("installationId")),
+            _field("Local IPv4", identity.get("localIpv4")),
+            _field("Public IPv4", identity.get("publicIpv4")),
+        ]),
+        Topic(GROUP_OVERVIEW, "System", [
+            _field("Agent status", identity.get("agentStatus")),
+            _field("Operating system", identity.get("osName")),
+            _field("OS version / build", identity.get("osVersion")),
+            _field("Agent version", identity.get("agentVersion")),
+            _field("Last updated", identity.get("lastUpdated")),
+        ]),
+        Topic(GROUP_OVERVIEW, "Utilization", utilization,
+              level=_worst_level(_usage_level(cpu_percent), _usage_level(memory_percent))),
+        Topic(GROUP_OVERVIEW, "Storage", storage_lines, level=storage_level),
     ]
 
 
-def _os_lines(os_info: dict) -> list[str]:
-    """Render the Windows and operating system section."""
+def _overview_storage(storage: dict) -> tuple[list[str], str | None]:
+    """Summarize drive usage and disk health for the Overview message.
+
+    Only the usage percentage, free space, and total size are shown here;
+    capacity, file system, and BitLocker detail stay in the Storage message,
+    so the summary and the detail never compete. Fixed volumes are listed
+    one by one; removable, network, and optical volumes are grouped into a
+    single line so they cannot crowd the dashboard.
+    """
+    logical = storage.get("logical") or []
+    physical = storage.get("physical") or []
+    fixed = [drive for drive in logical if drive.get("fixed")]
+    if fixed:
+        others = [drive for drive in logical if not drive.get("fixed")]
+    else:
+        fixed, others = list(logical), []
+
+    lines: list[str] = []
+    level = None
+    for drive in fixed:
+        percent = drive.get("percentValue")
+        level = _worst_level(level, _usage_level(percent))
+        lines.append(
+            f"- **{_device(drive.get('device'))}:** {_plain(drive.get('usedPercent'))} used | "
+            f"{_plain(drive.get('free'))} free of {_plain(drive.get('total'))}"
+            f"{_level_suffix(percent)}"
+        )
+    if others:
+        lines.append(
+            "- **Other volumes:** "
+            + ", ".join(
+                f"{_plain(drive.get('device'))} ({_plain(drive.get('type'))})"
+                for drive in others
+            )
+        )
+    for disk in physical:
+        lines.append(
+            f"- **Physical disk:** {_plain(disk.get('model'))} | "
+            f"health {_plain(disk.get('health'))} | state {_plain(disk.get('operational'))}"
+        )
+    if not lines:
+        lines.append(_field("Storage", UNAVAILABLE))
+    return lines, level
+
+
+# ---------------------------------------------------------------------------
+# Message 2 — Windows & Operating System
+# ---------------------------------------------------------------------------
+
+
+def _windows_topics(os_info: dict) -> list[Topic]:
+    """Build the operating-system group from the collected OS facts."""
     return [
-        _field("OS name", os_info.get("osName")),
-        _field("OS manufacturer", os_info.get("osManufacturer")),
-        _field("OS version", os_info.get("osVersion")),
-        _field("OS build number", os_info.get("osBuild")),
-        _field("Feature update", os_info.get("osDisplayVersion")),
-        _field("Edition", os_info.get("osEdition")),
-        _field("Architecture", os_info.get("osArchitecture")),
-        _field("OS configuration", os_info.get("osConfiguration")),
-        _field("OS build type", os_info.get("osBuildType")),
-        _field("Registered owner", os_info.get("registeredOwner")),
-        _field("Registered organization", os_info.get("registeredOrganization")),
-        _field("Windows product ID", os_info.get("productId")),
-        _field("Original install date", os_info.get("originalInstallDate")),
-        _field("System boot time", os_info.get("bootTime")),
-        _field("System uptime", os_info.get("uptime")),
-        _field("System locale", os_info.get("systemLocale")),
-        _field("Input locale", os_info.get("inputLocale")),
-        _field("Time zone", os_info.get("timeZone")),
-        _field("Domain / workgroup", os_info.get("domainWorkgroup")),
-        _field("Domain joined", os_info.get("partOfDomain")),
-        _field("Windows directory", os_info.get("windowsDirectory")),
-        _field("System directory", os_info.get("systemDirectory")),
-        _field("Boot device", os_info.get("bootDevice")),
-        _field("Firmware architecture", os_info.get("firmwareArchitecture")),
+        Topic(GROUP_WINDOWS, "Edition & Build", [
+            _field("OS name", os_info.get("osName")),
+            _field("OS manufacturer", os_info.get("osManufacturer")),
+            _field("OS version", os_info.get("osVersion")),
+            _field("OS build number", os_info.get("osBuild")),
+            _field("Feature update", os_info.get("osDisplayVersion")),
+            _field("Edition", os_info.get("osEdition")),
+            _field("Architecture", os_info.get("osArchitecture")),
+            _field("OS configuration", os_info.get("osConfiguration")),
+            _field("OS build type", os_info.get("osBuildType")),
+        ]),
+        Topic(GROUP_WINDOWS, "Windows Registration", [
+            _field("Registered owner", os_info.get("registeredOwner")),
+            _field("Registered organization", os_info.get("registeredOrganization")),
+            _field("Windows product ID", os_info.get("productId")),
+            _field("Original install date", os_info.get("originalInstallDate")),
+        ]),
+        Topic(GROUP_WINDOWS, "Runtime", [
+            _field("System boot time", os_info.get("bootTime")),
+            _field("System uptime", os_info.get("uptime")),
+            _field("System locale", os_info.get("systemLocale")),
+            _field("Input locale", os_info.get("inputLocale")),
+            _field("Time zone", os_info.get("timeZone")),
+        ]),
+        Topic(GROUP_WINDOWS, "Domain & Directories", [
+            _field("Domain / workgroup", os_info.get("domainWorkgroup")),
+            _field("Domain joined", os_info.get("partOfDomain")),
+            _field("Windows directory", os_info.get("windowsDirectory")),
+            _field("System directory", os_info.get("systemDirectory")),
+            _field("Boot device", os_info.get("bootDevice")),
+            _field("Firmware architecture", os_info.get("firmwareArchitecture")),
+        ]),
     ]
 
 
-def _cpu_lines(cpu: dict) -> list[str]:
-    """Render the processor section."""
-    return [
-        _field("Processor manufacturer", cpu.get("manufacturer")),
-        _field("Processor model", cpu.get("model")),
+# ---------------------------------------------------------------------------
+# Message 3 — Processor & Memory
+# ---------------------------------------------------------------------------
+
+
+def _compute_topics(cpu: dict, memory: dict) -> list[Topic]:
+    """Build the processor and memory group."""
+    cpu_percent = _number(cpu.get("utilization"))
+    memory_percent = _number(memory.get("usagePercent"))
+    cpu_lines = [
+        _field("CPU utilization", f"{_plain(cpu.get('utilization'))}{_level_suffix(cpu_percent)}"),
+        _field("CPU temperature", cpu.get("temperature")),
+        _field("Manufacturer", cpu.get("manufacturer")),
+        _field("Model", cpu.get("model")),
         _field("Identifier", cpu.get("identifier")),
         _field("Architecture", cpu.get("architecture")),
         _field("Physical cores", cpu.get("physicalCores")),
@@ -125,18 +353,15 @@ def _cpu_lines(cpu: dict) -> list[str]:
         _field("Virtualization support (firmware)", cpu.get("virtualizationFirmware")),
         _field("Virtualization extensions (SLAT)", cpu.get("virtualizationExtensions")),
         _field("Hypervisor present", cpu.get("hypervisorPresent")),
-        _field("CPU utilization (sampled)", cpu.get("utilization")),
-        _field("CPU temperature", cpu.get("temperature")),
     ]
-
-
-def _memory_lines(memory: dict) -> list[str]:
-    """Render the physical and virtual memory section with module details."""
-    lines = [
+    memory_lines = [
+        _field(
+            "Memory usage",
+            f"{_memory_usage_text(memory)}{_level_suffix(memory_percent)}",
+        ),
         _field("Total physical memory", memory.get("totalPhysical")),
         _field("Used memory", memory.get("usedPhysical")),
         _field("Available memory", memory.get("availablePhysical")),
-        _field("Memory usage", memory.get("usagePercent")),
         _field("Total virtual memory (commit limit)", memory.get("totalVirtual")),
         _field("Available virtual memory", memory.get("availableVirtual")),
         _field("Page file size", memory.get("pageFileSize")),
@@ -144,326 +369,341 @@ def _memory_lines(memory: dict) -> list[str]:
         _field("Installed module count", memory.get("moduleCount")),
     ]
     modules = memory.get("modules") or []
-    if not modules:
-        return lines + [_field("Memory modules", NOT_SUPPORTED)]
-    lines.append("")
-    lines.append("**Memory modules**")
-    for module in modules:
-        lines.append(
-            f"- {module.get('locator')} | {module.get('capacity')} | {module.get('type')} | "
-            f"{module.get('speed')} | {module.get('manufacturer')} | {module.get('partNumber')}"
+    if modules:
+        memory_lines.append("")
+        memory_lines.append(f"**Installed modules ({len(modules)})**")
+        memory_lines.extend(
+            f"- {_plain(module.get('locator'))} | {_plain(module.get('capacity'))} | "
+            f"{_plain(module.get('type'))} | {_plain(module.get('speed'))} | "
+            f"{_plain(module.get('manufacturer'))} | {_plain(module.get('partNumber'))}"
+            for module in modules
         )
-    return lines
+    else:
+        memory_lines.append(_field("Installed modules", UNAVAILABLE))
+
+    return [
+        Topic(GROUP_COMPUTE, "Processor", cpu_lines, level=_usage_level(cpu_percent)),
+        Topic(GROUP_COMPUTE, "Memory", memory_lines, level=_usage_level(memory_percent)),
+    ]
 
 
-def _graphics_lines(graphics: list) -> list[str]:
-    """Render one block per graphics adapter, including display output."""
+# ---------------------------------------------------------------------------
+# Message 4 — Graphics & Firmware
+# ---------------------------------------------------------------------------
+
+
+def _graphics_topics(graphics: list, board: dict) -> list[Topic]:
+    """Build the graphics adapters plus the motherboard and firmware group."""
+    adapters: list[str] = []
     if not graphics:
-        return [_field("Graphics adapters", UNAVAILABLE)]
-    lines: list[str] = []
+        adapters.append(_field("Graphics adapters", UNAVAILABLE))
     for index, gpu in enumerate(graphics, start=1):
         if index > 1:
-            lines.append("")
-        lines.extend([
+            adapters.append("")
+        adapters.extend([
             f"**GPU {index}: {_plain(gpu.get('name'))}**",
             _field("Manufacturer", gpu.get("manufacturer")),
             _field("Driver version", gpu.get("driverVersion")),
             _field("Driver date", gpu.get("driverDate")),
             _field("Dedicated memory (reported)", gpu.get("dedicatedMemory")),
-            _field("Shared memory", gpu.get("sharedMemory")),
-            _field("Utilization", gpu.get("utilization")),
-            _field("Temperature", gpu.get("temperature")),
             _field("Resolution", gpu.get("resolution")),
             _field("Refresh rate", gpu.get("refreshRate")),
             _field("HDR", gpu.get("hdr")),
-            _field("Status", gpu.get("status")),
+            _field("Adapter status", gpu.get("status")),
         ])
-    lines.append(_field("Detected adapters", str(len(graphics))))
-    return lines
+        # Windows exposes no per-adapter utilization, temperature, or shared
+        # memory, so the unsupported meters are stated once and name each
+        # capability instead of repeating the same marker on three lines.
+        unsupported = [
+            label for label, value in (
+                ("utilization", gpu.get("utilization")),
+                ("temperature", gpu.get("temperature")),
+                ("shared memory", gpu.get("sharedMemory")),
+            )
+            if value == NOT_SUPPORTED
+        ]
+        if unsupported:
+            adapters.append(
+                _field("Monitoring", f"{NOT_SUPPORTED} ({', '.join(unsupported)})")
+            )
+    if graphics:
+        adapters.append(_field("Detected adapters", str(len(graphics))))
 
-
-def _board_lines(board: dict) -> list[str]:
-    """Render the motherboard and firmware section."""
     return [
-        _field("Motherboard manufacturer", board.get("boardManufacturer")),
-        _field("Motherboard model", board.get("boardModel")),
-        _field("Motherboard version", board.get("boardVersion")),
-        _field("BIOS manufacturer", board.get("biosManufacturer")),
-        _field("BIOS version", board.get("biosVersion")),
-        _field("BIOS release date", board.get("biosReleaseDate")),
-        _field("Firmware mode", board.get("biosMode")),
-        _field("Secure Boot", board.get("secureBoot")),
-        _field("TPM available", board.get("tpmPresent")),
-        _field("TPM version", board.get("tpmVersion")),
-        _field("TPM firmware", board.get("tpmManufacturerVersion")),
+        Topic(GROUP_GRAPHICS, "Graphics Adapters", adapters),
+        Topic(GROUP_GRAPHICS, "System & Motherboard", [
+            _field("System manufacturer", board.get("systemManufacturer")),
+            _field("System model", board.get("systemModel")),
+            _field("System type", board.get("systemType")),
+            _field("Motherboard manufacturer", board.get("boardManufacturer")),
+            _field("Motherboard model", board.get("boardModel")),
+            _field("Motherboard version", board.get("boardVersion")),
+        ]),
+        Topic(GROUP_GRAPHICS, "BIOS & Firmware", [
+            _field("BIOS manufacturer", board.get("biosManufacturer")),
+            _field("BIOS version", board.get("biosVersion")),
+            _field("BIOS release date", board.get("biosReleaseDate")),
+            # The firmware mode is inferred from the Secure Boot state key,
+            # never read from firmware directly, so it is labelled as inferred.
+            _field("Firmware mode", _inferred(board.get("biosMode"))),
+            _field("Secure Boot", board.get("secureBoot")),
+        ]),
+        Topic(GROUP_GRAPHICS, "Trusted Platform Module", [
+            _field("TPM available", board.get("tpmPresent")),
+            _field("TPM version", board.get("tpmVersion")),
+            _field("TPM firmware", board.get("tpmManufacturerVersion")),
+        ]),
     ]
 
 
-def _storage_lines(storage: dict) -> list[str]:
-    """Render logical volumes, physical drives, health, and BitLocker state."""
-    lines = ["**Logical volumes**"]
+# ---------------------------------------------------------------------------
+# Message 5 — Storage
+# ---------------------------------------------------------------------------
+
+
+def _storage_topics(storage: dict) -> list[Topic]:
+    """Build the full storage group: volumes, physical drives, BitLocker."""
     logical = storage.get("logical") or []
-    if not logical:
-        lines.append(_field("Volumes", UNAVAILABLE))
-    for drive in logical:
-        lines.append(
-            f"- {drive.get('device')} | {drive.get('type')} | {drive.get('fileSystem')} | "
-            f"{drive.get('total')} total | {drive.get('used')} used | {drive.get('free')} free | "
-            f"{drive.get('usedPercent')} used"
-        )
-    lines.append("")
-    lines.append("**Physical drives**")
     physical = storage.get("physical") or []
-    if not physical:
-        lines.append(_field("Disks", UNAVAILABLE))
-    for disk in physical:
-        lines.append(
-            f"- {disk.get('model')} | {disk.get('mediaType')} | {disk.get('busType')} | "
-            f"{disk.get('size')} | health {disk.get('health')} | state {disk.get('operational')} | "
-            f"temp {disk.get('temperature')} | wear {disk.get('wear')}"
-        )
-    lines.append("")
-    lines.append("**BitLocker volumes**")
     bitlocker = storage.get("bitlocker") or []
-    if not bitlocker:
-        lines.append(_field("Volumes", UNAVAILABLE))
-    for volume in bitlocker:
-        lines.append(
-            f"- {volume.get('mountPoint')} | protection {volume.get('protection')} | "
-            f"{volume.get('status')} | {volume.get('encryption')} | {volume.get('percent')}"
+
+    volumes: list[str] = []
+    if not logical:
+        volumes.append(_field("Logical volumes", UNAVAILABLE))
+    for drive in logical:
+        if not drive.get("fixed"):
+            continue
+        volumes.append(f"- **{_device(drive.get('device'))}:** {_plain(drive.get('type'))} | "
+                       f"{_plain(drive.get('fileSystem'))} | label {_plain(drive.get('label'))}")
+        volumes.append(
+            f"  total {_plain(drive.get('total'))} | used {_plain(drive.get('used'))} "
+            f"({_plain(drive.get('usedPercent'))}) | free {_plain(drive.get('free'))}"
         )
-    return lines
+    others = [drive for drive in logical if not drive.get("fixed")]
+    if others:
+        # Removable, network, and optical volumes carry little usable detail
+        # on most machines, so they are grouped instead of repeated.
+        volumes.append(
+            "- **Other volumes:** "
+            + ", ".join(
+                f"{_plain(drive.get('device'))} ({_plain(drive.get('type'))}, "
+                f"{_plain(drive.get('fileSystem'))})"
+                for drive in others
+            )
+        )
+
+    drives: list[str] = []
+    if not physical:
+        drives.append(_field("Physical drives", UNAVAILABLE))
+    for disk in physical:
+        drives.append(f"- **{_plain(disk.get('model'))}:** {_plain(disk.get('mediaType'))} | "
+                      f"{_plain(disk.get('interface'))}")
+        drives.append(
+            f"  capacity {_plain(disk.get('size'))} | health {_plain(disk.get('health'))} | "
+            f"state {_plain(disk.get('operational'))} | temp {_plain(disk.get('temperature'))} | "
+            f"wear {_plain(disk.get('wear'))}"
+        )
+
+    encryption: list[str] = []
+    if not bitlocker:
+        encryption.append(_field("BitLocker volumes", UNAVAILABLE))
+    for volume in bitlocker:
+        encryption.append(
+            f"- **{_device(volume.get('mountPoint'))}:** protection {_plain(volume.get('protection'))} | "
+            f"{_plain(volume.get('status'))} | {_plain(volume.get('encryption'))} | "
+            f"{_plain(volume.get('percent'))}"
+        )
+
+    return [
+        Topic(GROUP_STORAGE, "Logical Volumes", volumes),
+        Topic(GROUP_STORAGE, "Physical Drives", drives),
+        Topic(GROUP_STORAGE, "BitLocker", encryption),
+    ]
 
 
-def _network_lines(network: dict) -> list[str]:
-    """Render every network adapter plus the connection summary."""
-    lines = [
+# ---------------------------------------------------------------------------
+# Message 6 — Network & Power
+# ---------------------------------------------------------------------------
+
+
+def _network_topics(network: dict, power: dict) -> list[Topic]:
+    """Build the network adapters plus the power and battery group."""
+    adapters = network.get("adapters") or []
+    summary = [
         _field("Internet connectivity", network.get("internetConnectivity")),
         _field("Public IPv4", network.get("publicIpv4")),
+        _field("Network adapter count", str(len(adapters)) if adapters else UNAVAILABLE),
         _field("Discord gateway connection", network.get("discordConnection")),
         _field("Discord gateway latency", network.get("discordLatency")),
-        "",
     ]
-    adapters = network.get("adapters") or []
+    details: list[str] = []
     if not adapters:
-        lines.append(_field("Network adapters", UNAVAILABLE))
-        return lines
-    lines.append(f"**Network adapters ({len(adapters)})**")
-    for adapter in adapters:
-        lines.append(
-            f"- {adapter.get('name')} | {adapter.get('description')} | {adapter.get('status')} | "
-            f"virtual {adapter.get('virtual')}"
-        )
-        lines.append(
-            f"  IPv4 {adapter.get('ipv4')} | IPv6 {adapter.get('ipv6')} | mask {adapter.get('subnet')} | "
-            f"gateway {adapter.get('gateway')} | DNS {adapter.get('dns')}"
-        )
-        lines.append(
-            f"  DHCP {adapter.get('dhcpEnabled')} | server {adapter.get('dhcpServer')} | "
-            f"MAC {adapter.get('mac')} | link {adapter.get('linkSpeed')} | "
-            f"rx {adapter.get('received')} | tx {adapter.get('sent')}"
-        )
-    return lines
+        details.append(_field("Network adapters", UNAVAILABLE))
+    for index, adapter in enumerate(adapters, start=1):
+        if index > 1:
+            details.append("")
+        details.extend([
+            f"**Adapter {index}: {_plain(adapter.get('name'))} - {_adapter_kind(adapter)}**",
+            _field("Description", adapter.get("description")),
+            _field("IPv4", adapter.get("ipv4")),
+            _field("IPv6", adapter.get("ipv6")),
+            _field("Subnet mask", adapter.get("subnet")),
+            _field("Default gateway", adapter.get("gateway")),
+            _field("DNS servers", adapter.get("dns")),
+            f"**DHCP:** {_plain(adapter.get('dhcpEnabled'))} | "
+            f"**DHCP server:** {_plain(adapter.get('dhcpServer'))}",
+            _field("MAC address", adapter.get("mac")),
+            _field("Link speed", adapter.get("linkSpeed")),
+            f"**Received:** {_plain(adapter.get('received'))} | "
+            f"**Sent:** {_plain(adapter.get('sent'))}",
+        ])
 
-
-def _power_lines(power: dict) -> list[str]:
-    """Render power source, battery, and the active power plan."""
     return [
-        _field("Power source", power.get("powerSource")),
-        _field("Battery present", power.get("batteryPresent")),
-        _field("Battery level", power.get("batteryLevel")),
-        _field("Charging status", power.get("charging")),
-        _field("Active power plan", power.get("powerPlan")),
-        _field("Sleep / hibernate settings", power.get("sleepStates")),
-    ]
-
-
-def _security_lines(security: dict) -> list[str]:
-    """Render Defender, firewall, update, and platform-security state."""
-    return [
-        _field("Windows Defender", security.get("defenderStatus")),
-        _field("Real-time protection", security.get("realTimeProtection")),
-        _field("Defender signature", security.get("defenderSignature")),
-        _field("Signature updated", security.get("defenderSignatureDate")),
-        _field("Windows Firewall", security.get("firewallStatus")),
-        _field("Last installed update", security.get("lastUpdate")),
-        _field("Installed hotfix count", security.get("hotfixCount")),
-        _field("Pending updates", security.get("pendingUpdates")),
-        _field("UAC", security.get("uacStatus")),
-        _field("Secure Boot", security.get("secureBoot")),
-        _field("TPM", security.get("tpmStatus")),
-        _field("BitLocker", security.get("bitlockerStatus")),
-    ]
-
-
-def _software_lines(software: dict) -> list[str]:
-    """Render the inventory counts and the complete application list."""
-    lines = [
-        _field("Installed application count", software.get("count")),
-        _field("Start Menu applications", software.get("startMenuCount")),
-        _field("Launchable Start Menu entries", software.get("startMenuAvailable")),
-        _field("Default browser", software.get("defaultBrowser")),
-        _field("Inventory collection", software.get("status")),
-        "",
-    ]
-    items = software.get("items") or []
-    if not items:
-        lines.append(_field("Applications", UNAVAILABLE))
-        return lines
-    lines.append(f"**Applications ({len(items)})**")
-    for item in items:
-        lines.append(f"- {item.get('name')} | {item.get('version')} | {item.get('publisher')}")
-    return lines
-
-
-def _process_lines(processes: dict, services: dict) -> list[str]:
-    """Render process counts, top consumers, the full process list, and services."""
-    lines = [
-        _field("Running processes", str(processes.get("count", UNAVAILABLE))),
-        _field("Services (total)", str(services.get("total", UNAVAILABLE))),
-        _field("Services (running)", str(services.get("running", UNAVAILABLE))),
-        _field("Services (stopped)", str(services.get("stopped", UNAVAILABLE))),
-        "",
-        "**Top CPU processes (CPU time since start)**",
-    ]
-    top_cpu = processes.get("topCpu") or []
-    if not top_cpu:
-        lines.append(_field("Processes", UNAVAILABLE))
-    for item in top_cpu:
-        lines.append(f"- {item.get('name')} ({item.get('pid')}) | {item.get('value')}")
-    lines.append("")
-    lines.append("**Top memory processes (working set)**")
-    top_memory = processes.get("topMemory") or []
-    if not top_memory:
-        lines.append(_field("Processes", UNAVAILABLE))
-    for item in top_memory:
-        lines.append(f"- {item.get('name')} ({item.get('pid')}) | {item.get('value')}")
-    lines.append("")
-    lines.append("**Running processes (name, PID)**")
-    items = processes.get("items") or []
-    if not items:
-        lines.append(_field("Processes", UNAVAILABLE))
-    for item in items:
-        lines.append(f"- {item.get('name')} ({item.get('pid')})")
-    lines.append("")
-    lines.append("**Services (name | display name | state | start type)**")
-    service_items = services.get("items") or []
-    if not service_items:
-        lines.append(_field("Services", UNAVAILABLE))
-    for service in service_items:
-        lines.append(
-            f"- {service.get('name')} | {service.get('display')} | "
-            f"{service.get('status')} | {service.get('startType')}"
-        )
-    return lines
-
-
-def _performance_lines(performance: dict) -> list[str]:
-    """Render sampled utilization counters and the sampling window."""
-    return [
-        _field("CPU utilization", performance.get("cpuUtilization")),
-        _field("Memory utilization", performance.get("memoryUtilization")),
-        _field("Disk read throughput", performance.get("diskRead")),
-        _field("Disk write throughput", performance.get("diskWrite")),
-        _field("Disk busy time", performance.get("diskBusy")),
-        _field("Network received", performance.get("networkReceived")),
-        _field("Network sent", performance.get("networkSent")),
-        _field("Sampling window", performance.get("sampleWindow")),
-        _field("Sample timestamp", performance.get("sampleTimestamp")),
-    ]
-
-
-def _environment_lines(environment: dict) -> list[str]:
-    """Render directory and environment availability facts."""
-    return [
-        _field("Windows directory", environment.get("windowsDirectory")),
-        _field("System directory", environment.get("systemDirectory")),
-        _field("Boot device", environment.get("bootDevice")),
-        _field("Firmware architecture", environment.get("firmwareArchitecture")),
-        _field("Environment collection", environment.get("environmentStatus")),
-        _field("Agent state directory", environment.get("stateDirectory")),
-        _field("Diagnostic log", environment.get("diagnosticLog")),
-        _field("Software inventory", environment.get("softwareStatus")),
-    ]
-
-
-def _agent_lines(agent: dict) -> list[str]:
-    """Render the Astral Relay agent section."""
-    return [
-        _field("Agent version", agent.get("version")),
-        _field("Installation ID", agent.get("installationId")),
-        _field("Agent uptime", agent.get("uptime")),
-        _field("Process ID", agent.get("pid")),
-        _field("Discord connection", agent.get("connection")),
-        _field("Discord latency", agent.get("latency")),
-        _field("Reconnect count", agent.get("reconnectCount")),
-        _field("Last successful update", agent.get("lastUpdate")),
-        _field("Enabled prefix commands", agent.get("commands")),
-        _field("Required management permission", agent.get("permission")),
-        _field("Managed category status", agent.get("categoryStatus")),
-        _field("Managed channel count", agent.get("channelCount")),
-        _field("Duplicate category warning", agent.get("duplicateWarning")),
-        _field("Startup registration", agent.get("startupRegistration")),
-        _field("Backup executable", agent.get("backupExecutable")),
-        _field("Diagnostic summary", agent.get("logSummary")),
-    ]
-
-
-def _plain(value) -> str:
-    """Render a value inside a bold heading without nesting markdown."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return UNAVAILABLE
-    return str(value)
-
-
-# ---------------------------------------------------------------------------
-# Blocks and message packing
-# ---------------------------------------------------------------------------
-
-
-def sections(inventory: dict) -> list[tuple[str, list[str]]]:
-    """Return the report sections in fixed display order."""
-    return [
-        ("Device Identity", _identity_lines(inventory.get("identity") or {})),
-        ("Windows & Operating System", _os_lines(inventory.get("os") or {})),
-        ("Processor", _cpu_lines(inventory.get("cpu") or {})),
-        ("Memory", _memory_lines(inventory.get("memory") or {})),
-        ("Graphics & Displays", _graphics_lines(inventory.get("graphics") or [])),
-        ("Motherboard & Firmware", _board_lines(inventory.get("board") or {})),
-        ("Storage", _storage_lines(inventory.get("storage") or {})),
-        ("Network", _network_lines(inventory.get("network") or {})),
-        ("Power & Battery", _power_lines(inventory.get("power") or {})),
-        ("Security & Updates", _security_lines(inventory.get("security") or {})),
-        ("Installed Software", _software_lines(inventory.get("software") or {})),
-        (
-            "Processes & Services",
-            _process_lines(inventory.get("processes") or {}, inventory.get("services") or {}),
-        ),
-        ("Performance", _performance_lines(inventory.get("performance") or {})),
-        ("System Directories & Environment", _environment_lines(inventory.get("environment") or {})),
-        ("Astral Relay Agent", _agent_lines(inventory.get("agent") or {})),
-    ]
-
-
-def header_block(inventory: dict) -> Block:
-    """Build the report title block shown at the top of the first message."""
-    identity = inventory.get("identity") or {}
-    return Block(
-        text="\n".join([
-            f"# {TITLE}",
-            _field("Status", identity.get("agentStatus")),
-            _field("Host", f"{_plain(identity.get('hostname'))} ({_plain(identity.get('installationId'))})"),
-            _field("Agent", f"v{_plain(identity.get('agentVersion'))}"),
-            _field("Updated", identity.get("lastUpdated")),
+        Topic(GROUP_NETWORK, "Connectivity", summary),
+        Topic(GROUP_NETWORK, "Network Adapters", details),
+        Topic(GROUP_NETWORK, "Power & Battery", [
+            _field("Power source", power.get("powerSource")),
+            _field("Battery present", power.get("batteryPresent")),
+            _field("Battery level", power.get("batteryLevel")),
+            _field("Charging status", power.get("charging")),
+            _field("Active power plan", power.get("powerPlan")),
+            _field("Sleep / hibernate", power.get("sleepStates")),
         ]),
+    ]
+
+
+def _adapter_kind(adapter: dict) -> str:
+    """Label an adapter with its link state and virtual/physical nature."""
+    status = _plain(adapter.get("status"))
+    virtual = adapter.get("virtual")
+    if virtual == "Yes":
+        kind = "virtual"
+    elif virtual == "No":
+        kind = "physical"
+    else:
+        kind = "type unknown"
+    return f"{status}, {kind}"
+
+
+# ---------------------------------------------------------------------------
+# Message 7 — Security & Updates
+# ---------------------------------------------------------------------------
+
+
+def _security_topics(security: dict) -> list[Topic]:
+    """Build the security and update group, including a platform summary."""
+    profiles = security.get("firewallProfiles") or []
+    firewall = (
+        [_field(f"Firewall ({_plain(profile.get('profile'))})", profile.get("state"))
+         for profile in profiles]
+        or [_field("Windows Firewall", UNAVAILABLE)]
     )
+    return [
+        Topic(GROUP_SECURITY, "Windows Defender", [
+            _field("Defender status", security.get("defenderStatus")),
+            _field("Real-time protection", security.get("realTimeProtection")),
+            _field("Signature version", security.get("defenderSignature")),
+            _field("Signature updated", security.get("defenderSignatureDate")),
+        ]),
+        Topic(GROUP_SECURITY, "Windows Firewall", firewall),
+        Topic(GROUP_SECURITY, "Windows Updates", [
+            _field("Last installed update", security.get("lastUpdate")),
+            _field("Installed hotfix count", security.get("hotfixCount")),
+            _field("Pending updates", security.get("pendingUpdates")),
+        ]),
+        Topic(GROUP_SECURITY, "User Account Control", [
+            _field("UAC", security.get("uacStatus")),
+        ]),
+        Topic(GROUP_SECURITY, "Platform Security", [
+            # Secure Boot, TPM, and BitLocker detail lives in the firmware and
+            # storage messages; this one line keeps the security overview
+            # complete without repeating every field.
+            f"**Secure Boot:** {_plain(security.get('secureBoot'))} | "
+            f"**TPM:** {_plain(security.get('tpmStatus'))} | "
+            f"**BitLocker:** {_plain(security.get('bitlockerStatus'))}",
+        ]),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Message 8 — Performance & Agent
+# ---------------------------------------------------------------------------
+
+
+def _agent_topics(performance: dict, agent: dict, environment: dict) -> list[Topic]:
+    """Build the performance and agent diagnostics group."""
+    return [
+        Topic(GROUP_AGENT, "Performance", [
+            _field("CPU utilization", performance.get("cpuUtilization")),
+            _field("Memory utilization", performance.get("memoryUtilization")),
+            _field("Disk read throughput", performance.get("diskRead")),
+            _field("Disk write throughput", performance.get("diskWrite")),
+            _field("Disk busy time", performance.get("diskBusy")),
+            _field("Network received", performance.get("networkReceived")),
+            _field("Network sent", performance.get("networkSent")),
+            _field("Sampling window", performance.get("sampleWindow")),
+            _field("Sample timestamp", performance.get("sampleTimestamp")),
+        ]),
+        Topic(GROUP_AGENT, "Astral Relay Agent", [
+            _field("Agent version", agent.get("version")),
+            _field("Installation ID", agent.get("installationId")),
+            _field("Agent uptime", agent.get("uptime")),
+            _field("Discord connection", agent.get("connection")),
+            _field("Discord latency", agent.get("latency")),
+            _field("Reconnect count", agent.get("reconnectCount")),
+            _field("Last successful update", agent.get("lastUpdate")),
+            _field("Required management permission", agent.get("requiredPermission")),
+            _field("Managed category status", agent.get("categoryStatus")),
+            _field("Managed channel count", agent.get("channelCount")),
+            _field("Duplicate category warning", agent.get("duplicateWarning")),
+            _field("Startup registration", agent.get("startupRegistration")),
+            _field("Backup executable", agent.get("backupExecutable")),
+            _field("Diagnostic summary", agent.get("logSummary")),
+        ]),
+        Topic(GROUP_AGENT, "Agent Environment", [
+            _field("Environment collection", environment.get("environmentStatus")),
+            _field("Agent state directory", environment.get("stateDirectory")),
+            _field("Diagnostic log", environment.get("diagnosticLog")),
+        ]),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Topics and message packing
+# ---------------------------------------------------------------------------
+
+
+def topics(inventory: dict) -> list[Topic]:
+    """Return every report section in the fixed message-group order.
+
+    The Overview is always first, so the published report always opens with
+    the dashboard. Sections never carry duplicated facts: the operating
+    system directories live in the OS group, and the Secure Boot, TPM, and
+    BitLocker details live in the graphics/firmware and storage groups,
+    leaving the security group a single combined platform line.
+    """
+    inventory = inventory or {}
+    return [
+        *_overview_topics(inventory),
+        *_windows_topics(inventory.get("os") or {}),
+        *_compute_topics(inventory.get("cpu") or {}, inventory.get("memory") or {}),
+        *_graphics_topics(inventory.get("graphics") or [], inventory.get("board") or {}),
+        *_storage_topics(inventory.get("storage") or {}),
+        *_network_topics(inventory.get("network") or {}, inventory.get("power") or {}),
+        *_security_topics(inventory.get("security") or {}),
+        *_agent_topics(
+            inventory.get("performance") or {},
+            inventory.get("agent") or {},
+            inventory.get("environment") or {},
+        ),
+    ]
 
 
 def build_blocks(inventory: dict) -> list[Block]:
     """Turn one collected inventory into ordered, size-limited blocks."""
-    blocks = [header_block(inventory)]
-    for title, lines in sections(inventory):
-        blocks.extend(_section_blocks(title, lines))
+    blocks: list[Block] = []
+    for topic in topics(inventory):
+        blocks.extend(_topic_blocks(topic))
     return blocks
 
 
@@ -478,53 +718,79 @@ def _flatten(lines: list[str]) -> list[str]:
     return result
 
 
-def _body_block(title: str, lines: list[str], first: bool) -> Block:
-    """Build one section body, repeating the heading on continuations."""
-    heading = f"## {title}" if first else f"## {title} (continued)"
-    return Block(text=heading + "\n" + "\n".join(lines), heading=True)
+def _topic_block(topic: Topic, lines: list[str], first: bool) -> Block:
+    """Build one section body.
+
+    The first chunk opens the section with its heading; later chunks are plain
+    bodies with no heading at all, so a section title is printed exactly once
+    and never repeated inside or across messages.
+    """
+    body = "\n".join(lines)
+    if first:
+        return Block(
+            text=f"### {topic.title}\n{body}",
+            group=topic.group,
+            heading=True,
+            section=topic.title,
+            level=topic.level,
+        )
+    return Block(
+        text=body,
+        group=topic.group,
+        continuation=True,
+        section=topic.title,
+        level=topic.level,
+    )
 
 
-def _section_blocks(title: str, lines: list[str]) -> list[Block]:
+def _topic_blocks(topic: Topic) -> list[Block]:
     """Split one section into body blocks that stay under one message budget."""
-    if not lines:
+    if not topic.lines:
         return []
     blocks: list[Block] = []
     chunk: list[str] = []
     length = 0
     first = True
-    for line in _flatten(lines):
+    for line in _flatten(topic.lines):
         cost = len(line) + 1
         if chunk and length + cost > SECTION_CHUNK:
-            blocks.append(_body_block(title, chunk, first))
+            blocks.append(_topic_block(topic, chunk, first))
             first = False
             chunk = []
             length = 0
         chunk.append(line)
         length += cost
     if chunk:
-        blocks.append(_body_block(title, chunk, first))
+        blocks.append(_topic_block(topic, chunk, first))
     return blocks
 
 
 def pack_blocks(blocks: list[Block]) -> list[list[Block]]:
     """Pack blocks into pages that respect every Discord message limit.
 
-    Blocks are never reordered, split, or dropped, so the published
-    report always contains every item exactly once and in order.
+    A new page always starts at a message-group boundary, so each group is
+    published as its own message (or as its own run of messages when the
+    group is long). Blocks are never reordered, split, or dropped, so the
+    published report always contains every item exactly once and in order.
+    Every page reserves room for the message title, the group heading, and a
+    section title repeated when a body continues at the top of that page;
+    all three are added at view-build time, after packing.
     """
     pages: list[list[Block]] = []
     page: list[Block] = []
-    length = 0
-    children = 0
+    length = PAGE_RESERVE_TEXT
+    children = PAGE_RESERVE_COMPONENTS
     for block in blocks:
         cost = len(block.text)
-        added = 1 + (1 if (page and block.heading) else 0)
-        if page and (length + cost > TEXT_BUDGET or children + added > COMPONENT_BUDGET - 1):
+        added = 2  # one TextDisplay plus its separator
+        starts_group = bool(page) and page[-1].group != block.group
+        over_limit = bool(page) and (length + cost > TEXT_BUDGET
+                                     or children + added > COMPONENT_BUDGET)
+        if page and (starts_group or over_limit):
             pages.append(page)
             page = []
-            length = 0
-            children = 0
-            added = 1
+            length = PAGE_RESERVE_TEXT
+            children = PAGE_RESERVE_COMPONENTS
         page.append(block)
         length += cost
         children += added
@@ -539,20 +805,53 @@ def build_report(inventory: dict) -> tuple[list[Block], list[list[Block]]]:
     return blocks, pack_blocks(blocks)
 
 
+# ---------------------------------------------------------------------------
+# Components V2 views
+# ---------------------------------------------------------------------------
+
+
+def _part_title(index: int, total: int) -> str:
+    """Render the message title, which carries its report position."""
+    return f"# {TITLE} (Part {index + 1} of {total})"
+
+
+def _page_level(page: list[Block]):
+    """Return the highest severity carried by any block on the page."""
+    level = None
+    for block in page:
+        if _LEVEL_RANK.get(block.level, 0) > _LEVEL_RANK.get(level, 0):
+            level = block.level
+    return level
+
+
 def build_views(pages: list[list[Block]]) -> list:
-    """Build one Components V2 LayoutView per packed page, in order."""
+    """Build one Components V2 LayoutView per packed page, in order.
+
+    Every message opens with its title and its group heading, so the reader
+    can always identify the message and its topic. Continuation is carried by
+    the title alone: a group or section that continues from an earlier message
+    is never re-labelled, so no heading is ever repeated with a "(continued)"
+    marker. The container accent colour reflects the highest severity on the
+    page, always alongside the matching text. No select menu, button, or other
+    interactive control is ever added.
+    """
     import discord
     from discord import ui
 
+    total = len(pages)
     views = []
-    for page in pages:
-        children = []
-        for index, block in enumerate(page):
-            if index and block.heading:
+    for index, page in enumerate(pages):
+        group = page[0].group
+        children = [ui.TextDisplay(_part_title(index, total))]
+        if group:
+            children.append(ui.TextDisplay(f"## {group}"))
+        for position, block in enumerate(page):
+            if position > 0 or group:
                 children.append(ui.Separator(spacing=discord.SeparatorSpacing.small))
             children.append(ui.TextDisplay(block.text))
+        colour = LEVEL_COLOURS.get(_page_level(page), ACCENT_COLOUR)
         view = ui.LayoutView(timeout=None)
-        view.add_item(ui.Container(*children, accent_colour=discord.Colour(ACCENT_COLOUR)))
+        view.add_item(ui.Container(*children, accent_colour=discord.Colour(colour)))
         views.append(view)
     return views
 

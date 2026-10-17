@@ -272,14 +272,23 @@ def test_read_registration_marks_an_absent_task(tmp_path, monkeypatch):
     import sys as sys_mod
 
     from astral_relay.agent.startup import read_registration
+    from astral_relay.shared import winproc
 
     monkeypatch.setitem(sys_mod.modules, "winreg", FakeWinreg())
 
     class Proc:
         returncode = 1
 
-    monkeypatch.setattr(subprocess_mod, "run", lambda cmd, **kwargs: Proc())
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return Proc()
+
+    monkeypatch.setattr(subprocess_mod, "run", fake_run)
     assert read_registration("astral-relay", env={"APPDATA": str(tmp_path)})["logonTask"] == "absent"
+    assert winproc.CREATE_NO_WINDOW
+    assert captured["creationflags"] & winproc.CREATE_NO_WINDOW
 
 
 def test_read_registration_survives_a_missing_task_command(tmp_path, monkeypatch):
@@ -301,8 +310,10 @@ def test_logon_task_registers_once(monkeypatch):
     import subprocess as subprocess_mod
 
     from astral_relay.agent.startup import ensure_logon_task
+    from astral_relay.shared import winproc
 
     calls = []
+    captured = []
 
     class Proc:
         def __init__(self, code):
@@ -310,6 +321,7 @@ def test_logon_task_registers_once(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        captured.append(kwargs)
         if any("query" in part for part in cmd):
             return Proc(1)
         return Proc(0)
@@ -317,6 +329,10 @@ def test_logon_task_registers_once(monkeypatch):
     monkeypatch.setattr(subprocess_mod, "run", fake_run)
     assert ensure_logon_task("C:\\a.exe") == "added"
     assert any("/create" in c for c in calls)
+    # schtasks runs hidden so the agent never flashes a console window.
+    assert winproc.CREATE_NO_WINDOW
+    assert all(k["creationflags"] & winproc.CREATE_NO_WINDOW for k in captured)
+    assert all(k["shell"] is False for k in captured)
 
     calls.clear()
     assert ensure_logon_task("C:\\a.exe", task_name="MyAgent") == "added"

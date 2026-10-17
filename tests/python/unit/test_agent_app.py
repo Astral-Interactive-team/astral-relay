@@ -72,7 +72,7 @@ def test_self_test_bad_config_maps_to_config_code(monkeypatch):
     module = types.ModuleType("astral_relay._embedded_payload")
     module.PAYLOAD_V = 2
     module.TOKEN = TOKEN_A
-    module.CONFIG = {"requiredPermission": "Nope"}
+    module.CONFIG = {"agentVersion": ""}
     monkeypatch.setitem(sys.modules, "astral_relay._embedded_payload", module)
     assert handle_self_test(["--self-test"]) == EXIT_BAD_CONFIG
     assert EXIT_OK == 0
