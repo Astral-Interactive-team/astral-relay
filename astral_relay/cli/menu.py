@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import webbrowser
 
 from rich.console import Console
@@ -24,6 +25,10 @@ from astral_relay.cli.views import (
     render_banner_text,
     status_panel,
 )
+
+# Blank-screen hold before the first interactive paint. Non-interactive
+# streams (pipes, logs) skip it entirely so captured output stays plain.
+STARTUP_BLANK_SECONDS = 0.7
 
 
 def parse_home_choice(raw) -> str | None:
@@ -110,6 +115,24 @@ def prompt_rows(raw, enabled: bool, width=None) -> int:
     return rows
 
 
+def _write_raw(console: Console, text: str) -> bool:
+    """Write raw control text to the console stream. False when unwritable.
+
+    Centralizes the best-effort write-and-flush with the exception guard
+    shared by every cursor-control and alt-screen sequence, so pipes and
+    closed streams never raise.
+    """
+    try:
+        stream = console.file
+        if stream is None:
+            return False
+        stream.write(text)
+        stream.flush()
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def erase_lines(console: Console, count: int) -> None:
     """Erase the last `count` physical lines in place (cursor up + clear).
 
@@ -118,17 +141,8 @@ def erase_lines(console: Console, count: int) -> None:
     """
     if not isinstance(count, int) or count <= 0:
         return
-    try:
-        stream = console.file
-        if stream is None:
-            return
-        stream.write(f"\x1b[{count}A")
-        for _ in range(count):
-            stream.write("\x1b[2K\x1b[1B")
-        stream.write(f"\x1b[{count}A")
-        stream.flush()
-    except (OSError, ValueError, AttributeError):
-        pass
+    sequence = f"\x1b[{count}A" + "\x1b[2K\x1b[1B" * count + f"\x1b[{count}A"
+    _write_raw(console, sequence)
 
 
 def is_interactive(console: Console) -> bool:
@@ -150,13 +164,7 @@ def refresh_screen(console: Console, art: str, enabled: bool, width=None) -> Non
     logs, and result output never pile up above the menu. Banner content
     itself is never modified. Pipes and logs are untouched.
     """
-    try:
-        stream = console.file
-        if stream is None:
-            return
-        stream.write("\x1b[H\x1b[2J")
-        stream.flush()
-    except (OSError, ValueError, AttributeError):
+    if not _write_raw(console, "\x1b[H\x1b[2J"):
         return
     if art != "":
         print_block(console, render_banner_text(art, enabled, width))
@@ -174,23 +182,11 @@ class _AlternateScreen:
         self._console = console
 
     def __enter__(self) -> "_AlternateScreen":
-        try:
-            stream = self._console.file
-            if stream is not None:
-                stream.write("\x1b[?1049h\x1b[H\x1b[2J")
-                stream.flush()
-        except (OSError, ValueError, AttributeError):
-            pass
+        _write_raw(self._console, "\x1b[?1049h\x1b[H\x1b[2J")
         return self
 
     def __exit__(self, *exc_info) -> bool:
-        try:
-            stream = self._console.file
-            if stream is not None:
-                stream.write("\x1b[?1049l")
-                stream.flush()
-        except (OSError, ValueError, AttributeError):
-            pass
+        _write_raw(self._console, "\x1b[?1049l")
         return False
 
 
@@ -211,6 +207,11 @@ def run_menu() -> int:
 
     screen = _AlternateScreen(console) if interactive else nullcontext()
     with screen:
+        # Interactive sessions open on a cleared alternate screen; hold it
+        # blank briefly so the banner appears a beat after launch instead
+        # of snapping in on the same frame as the buffer switch.
+        if interactive:
+            time.sleep(STARTUP_BLANK_SECONDS)
         if art != "":
             print_block(console, render_banner_text(art, enabled, width))
         page = "home"
@@ -222,16 +223,18 @@ def run_menu() -> int:
                 raw = read_choice(console, enabled)
             except InterruptedError:
                 return 0
-            if interactive:
+            # Option 01 (Generate EXE) keeps the RELAY menu and the echoed
+            # choice on screen, so its token and output-name prompts appear
+            # directly below the menu. Every other choice erases the menu
+            # first so the next draw replaces this region instead of
+            # stacking another menu underneath it.
+            keep_menu = page == "relay" and parse_relay_choice(raw) == "generate"
+            if interactive and not keep_menu:
                 # Terminate the input row explicitly: real terminals already
                 # moved to a fresh row on Enter while non-echoing streams did
                 # not, so one forced newline makes the cursor position (and
                 # therefore the erase count) deterministic in both cases.
-                try:
-                    console.file.write("\n")
-                    console.file.flush()
-                except (OSError, ValueError, AttributeError):
-                    pass
+                _write_raw(console, "\n")
                 # Erase the menu block plus prompt/echoed input before running
                 # the action, so the next draw replaces this region instead of
                 # appending another menu below it. Action output (results,
@@ -257,7 +260,7 @@ def run_menu() -> int:
             else:
                 choice = parse_relay_choice(raw)
                 if choice == "generate":
-                    run_generate(console, enabled)
+                    run_generate(console, enabled, show_token_header=False)
                     if interactive:
                         refresh_screen(console, art, enabled, width)
                 elif choice == "start":
@@ -288,23 +291,30 @@ def wait_to_continue(console: Console, enabled: bool) -> None:
     except (KeyboardInterrupt, EOFError):
         return
     if is_interactive(console):
-        try:
-            console.file.write("\n")
-            console.file.flush()
-        except (OSError, ValueError, AttributeError):
-            pass
+        _write_raw(console, "\n")
         erase_lines(console, 2)
 
 
-def run_generate(console: Console, enabled: bool) -> bool:
-    """Run the EXE build with staged progress reporting. Returns True on success."""
+def run_generate(console: Console, enabled: bool, show_token_header: bool = True) -> bool:
+    """Run the EXE build with staged progress reporting. Returns True on success.
+
+    `show_token_header` keeps the void-style token header for standalone
+    builds (the `build` subcommand). The interactive menu passes False
+    because it keeps its own prompt block on screen.
+    """
     from rich.text import Text as RichText
 
-    from astral_relay.builder.build import build_agent, prompt_build_token, prompt_exe_name
+    from astral_relay.builder.build import (
+        build_agent,
+        prompt_autostart,
+        prompt_build_token,
+        prompt_exe_name,
+        prompt_install_appdata,
+    )
 
     stages = ["Validating token", "Preparing template", "Injecting payload", "Verifying output"]
     try:
-        token = prompt_build_token()
+        token = prompt_build_token(show_header=show_token_header)
     except InterruptedError:
         return False
     except (OSError, ValueError) as err:
@@ -313,6 +323,8 @@ def run_generate(console: Console, enabled: bool) -> bool:
         return False
     try:
         output_name = prompt_exe_name()
+        install_appdata = prompt_install_appdata()
+        autostart = prompt_autostart()
     except InterruptedError:
         return False
     progress = Progress(
@@ -324,7 +336,8 @@ def run_generate(console: Console, enabled: bool) -> bool:
             task = progress.add_task("Building", total=len(stages))
             def on_stage(name: str) -> None:
                 progress.update(task, description=name, advance=1)
-            result = build_agent(token=token, on_stage=on_stage, output_name=output_name)
+            result = build_agent(token=token, on_stage=on_stage, output_name=output_name,
+                                 install_to_appdata=install_appdata, enable_autostart=autostart)
     except (InterruptedError, KeyboardInterrupt):
         # Build cancelled: stop only the build, back to menu.
         return False

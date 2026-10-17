@@ -1,4 +1,4 @@
-# EXE build pipeline for dist/AstralRelay-Agent.exe.
+# EXE build pipeline for dist/astral-relay.exe.
 # Flow: validate token and default config before work, create an isolated
 # staging package copy under build-tmp/, generate _embedded_payload.py
 # only inside that staged copy, run PyInstaller --onefile --noconsole,
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import datetime
+import importlib.util
 import os
 import random
 import shutil
@@ -28,15 +29,15 @@ from astral_relay.agent.secure_input import InterruptedError, prompt_for_token
 from astral_relay.builder.payload_codegen import render_payload_module
 from astral_relay.builder.subsystem import set_gui_subsystem
 from astral_relay.builder.verification import check_gui_subsystem, check_size, self_test, smoke_test
-from astral_relay.shared.config import default_runtime_config
+from astral_relay.shared.config import DEFAULT_STARTUP_NAME, default_runtime_config
 from astral_relay.shared.errors import BuildError
 from astral_relay.shared.logging_utils import error, info, redact
 
-ROOT = Path(__file__).resolve().parent.parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 DIST_DIR = ROOT / "dist"
-OUTPUT_EXE = DIST_DIR / "AstralRelay-Agent.exe"
+OUTPUT_EXE = DIST_DIR / "astral-relay.exe"
 BUILD_TMP = ROOT / "build-tmp"
-SRC_PACKAGE = ROOT / "src" / "astral_relay"
+SRC_PACKAGE = ROOT / "astral_relay"
 
 _TRACKED_STAGING: list[Path] = []
 
@@ -55,12 +56,16 @@ def _cleanup_tracked() -> None:
 atexit.register(_cleanup_tracked)
 
 
-def prompt_build_token() -> str:
-    """Secure build-time token prompt. Masked input, empty rejected."""
-    return prompt_for_token()
+def prompt_build_token(show_header: bool = True) -> str:
+    """Secure build-time token prompt. Masked input, empty rejected.
+
+    `show_header` is forwarded to the token prompt. The interactive menu
+    passes False because it keeps its own prompt block on screen.
+    """
+    return prompt_for_token(show_header=show_header)
 
 
-DEFAULT_EXE_NAME = "AstralRelay-Agent.exe"
+DEFAULT_EXE_NAME = "astral-relay.exe"
 
 
 def sanitize_exe_name(raw=None, default: str = DEFAULT_EXE_NAME) -> str:
@@ -85,9 +90,18 @@ def sanitize_exe_name(raw=None, default: str = DEFAULT_EXE_NAME) -> str:
 
 
 def prompt_exe_name(default: str = DEFAULT_EXE_NAME) -> str:
-    """Ask for the output EXE name. Bare Enter selects the default."""
+    """Ask for the output EXE name. Bare Enter selects the default.
+
+    Themed with the shared purple palette via the same styling path as
+    the token prompt. Non-TTY streams (pipes, tests) get plain text, so
+    captured output and assertions stay uncolored.
+    """
+    from astral_relay.agent.secure_input import _styled_line
+    from astral_relay.cli.theme import supports_color
+
+    label = f"[Output EXE name] (default: {default}): "
     try:
-        sys.stdout.write(f"Output EXE name [{default}]: ")
+        sys.stdout.write(_styled_line(label, supports_color()))
         sys.stdout.flush()
     except (OSError, ValueError, AttributeError):
         pass
@@ -105,6 +119,46 @@ def prompt_exe_name(default: str = DEFAULT_EXE_NAME) -> str:
         return default
 
 
+def prompt_bool(label: str, default: bool = True) -> bool:
+    """Ask a yes/no build option. Bare Enter or unrecognized input keeps `default`.
+
+    Styled through the same path as the token and name prompts; non-TTY
+    streams (pipes, tests) get plain text, so captured output stays
+    uncolored.
+    """
+    from astral_relay.agent.secure_input import _styled_line
+    from astral_relay.cli.theme import supports_color
+
+    hint = "Y/n" if default else "y/N"
+    try:
+        sys.stdout.write(_styled_line(f"[{label}] ({hint}): ", supports_color()))
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        readline = getattr(sys.stdin, "readline", None)
+        raw = (readline() if callable(readline) else "").strip().lower()
+    except KeyboardInterrupt as exc:
+        raise InterruptedError("INTERRUPTED") from exc
+    except (EOFError, OSError, ValueError):
+        return default
+    if raw in ("y", "yes"):
+        return True
+    if raw in ("n", "no"):
+        return False
+    return default
+
+
+def prompt_install_appdata() -> bool:
+    """Ask whether the built EXE should copy itself under %APPDATA%."""
+    return prompt_bool("Copy Agent into %APPDATA%", default=True)
+
+
+def prompt_autostart() -> bool:
+    """Ask whether the built EXE should register Windows autostart."""
+    return prompt_bool("Register Windows autostart", default=True)
+
+
 def resolve_build_token(token=None, prompt_token=None) -> str:
     """Resolve the build token from an argument or secure prompt, validated first."""
     prompt = prompt_token if prompt_token is not None else prompt_build_token
@@ -112,6 +166,21 @@ def resolve_build_token(token=None, prompt_token=None) -> str:
     if not is_plausible_bot_token(live):
         raise BuildError("Token rejected: expected bot token shape (three dot-separated parts).")
     return live.strip()
+
+
+def _ensure_pyinstaller() -> None:
+    """Fail fast when the interpreter running the build lacks PyInstaller.
+
+    The packager runs as `sys.executable -m PyInstaller`, so a build
+    started from a Python without PyInstaller would otherwise fail inside
+    the child process with an opaque exit code. Checking here turns that
+    into an actionable message before any token prompt or staging work.
+    """
+    if importlib.util.find_spec("PyInstaller") is None:
+        raise BuildError(
+            f"PyInstaller is not installed for {sys.executable}. "
+            "Install the build dependencies first: python -m pip install -r requirements.txt"
+        )
 
 
 def _stage_package() -> Path:
@@ -195,10 +264,19 @@ def _stage_log_path() -> Path:
     return DIST_DIR / f"build-py-{stamp}.log"
 
 
-def build_agent(token=None, prompt_token=None, on_stage=None, output_name: str | None = None) -> dict:
-    """Generate the EXE with an embedded token plus default non-secret config."""
-    staged_config = default_runtime_config()
-    output_exe = DIST_DIR / sanitize_exe_name(output_name or DEFAULT_EXE_NAME)
+def build_agent(token=None, prompt_token=None, on_stage=None, output_name: str | None = None,
+                install_to_appdata: bool = True, enable_autostart: bool = True) -> dict:
+    """Generate the EXE with an embedded token plus default non-secret config.
+
+    `install_to_appdata` and `enable_autostart` are embedded as the EXE's
+    build-time self-install choices. The output name (without extension)
+    becomes the `%APPDATA%` subfolder and autostart entry name.
+    """
+    _ensure_pyinstaller()
+    exe_name = sanitize_exe_name(output_name or DEFAULT_EXE_NAME)
+    startup_name = Path(exe_name).stem or DEFAULT_STARTUP_NAME
+    staged_config = default_runtime_config(install_to_appdata, enable_autostart, startup_name)
+    output_exe = DIST_DIR / exe_name
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_TMP.mkdir(parents=True, exist_ok=True)
     log_lines: list[str] = []

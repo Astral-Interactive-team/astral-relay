@@ -7,14 +7,23 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from astral_relay.builder.build import build_agent, prompt_exe_name  # noqa: E402
+from astral_relay.builder.build import (  # noqa: E402
+    build_agent,
+    prompt_autostart,
+    prompt_exe_name,
+    prompt_install_appdata,
+)
 
 
 def main() -> int:
     try:
-        result = build_agent(output_name=prompt_exe_name())
+        result = build_agent(
+            output_name=prompt_exe_name(),
+            install_to_appdata=prompt_install_appdata(),
+            enable_autostart=prompt_autostart(),
+        )
     except KeyboardInterrupt:
         return 0
     except Exception as exc:  # noqa: BLE001 - build errors are user-safe by construction

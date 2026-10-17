@@ -39,7 +39,19 @@ def test_prompt_rejects_empty_with_fake_msvcrt(monkeypatch):
     with pytest.raises(ValueError, match="Empty token"):
         prompt_for_token(output_stream=out)
     assert void_header() in out.getvalue()
-    assert void_prompt("Discord Bot Token") in out.getvalue()
+    assert void_prompt("[Discord Bot Token]") in out.getvalue()
+
+
+def test_prompt_without_header_keeps_single_block(monkeypatch):
+    import astral_relay.agent.secure_input as mod
+
+    out = FakeTTY()
+    monkeypatch.setattr(mod, "read_secure_line", lambda prefix="", input_stream=None, output_stream=None: "tok123")
+    assert prompt_for_token(output_stream=out, show_header=False) == "tok123"
+    written = out.getvalue()
+    assert void_header() not in written
+    assert void_prompt("[Discord Bot Token]") not in written
+    assert "[Discord Bot Token]: " in written
 
 
 def test_prompt_returns_trimmed_without_printing(monkeypatch):

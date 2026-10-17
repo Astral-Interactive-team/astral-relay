@@ -1,8 +1,10 @@
 # Unit tests for the prefix-command bot: routing, authz, arg validation,
-# case-insensitivity, DM behavior, and intent diagnostics.
+# case-insensitivity, DM behavior, intent diagnostics, and the managed
+# #info auto-delete listener.
 # Uses discord.py with fake contexts; no network contact.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +98,14 @@ def test_lock_replies():
     assert "locked" in ctx.sent[0].lower() or "could not" in ctx.sent[0].lower()
 
 
+def test_reconnect_counter_starts_at_zero_and_counts_resumes():
+    bot = bot_mod.build_bot(_config())
+    assert bot._astral_reconnects == 0
+    _run(bot.on_resumed())
+    _run(bot.on_resumed())
+    assert bot._astral_reconnects == 2
+
+
 def test_unauthorized_member_denied():
     bot = bot_mod.build_bot(_config())
     cmd = bot.get_command("pc").get_command("status")
@@ -137,3 +147,71 @@ def test_no_slash_registration_in_bot():
     assert "tree.sync(" not in source
     assert "import app_commands" not in source
     assert "add_application_command" not in source
+
+
+class FakeInfoMessage:
+    def __init__(self, channel_id, bot_author=False, deletable=True):
+        self.channel = SimpleNamespace(id=channel_id)
+        self.author = SimpleNamespace(bot=bot_author)
+        self.deleted = False
+        self.deletable = deletable
+
+    async def delete(self):
+        if not self.deletable:
+            raise RuntimeError("Missing Permissions")
+        self.deleted = True
+
+
+def test_info_channel_deletes_member_messages(monkeypatch):
+    import astral_relay.agent.discord_setup as setup
+
+    monkeypatch.setattr(setup, "is_info_channel", lambda channel_id: channel_id == 777)
+    bot = bot_mod.build_bot(_config())
+    processed = []
+
+    async def fake_process(message):
+        processed.append(message)
+
+    monkeypatch.setattr(bot, "process_commands", fake_process)
+
+    message = FakeInfoMessage(777)
+    _run(bot.on_message(message))
+    assert message.deleted is True
+    assert processed == []
+
+
+def test_info_channel_ignores_undeletable_message(monkeypatch):
+    import astral_relay.agent.discord_setup as setup
+
+    monkeypatch.setattr(setup, "is_info_channel", lambda channel_id: True)
+    bot = bot_mod.build_bot(_config())
+
+    async def fake_process(message):  # pragma: no cover - must not run
+        raise AssertionError("commands must not run in #info")
+
+    monkeypatch.setattr(bot, "process_commands", fake_process)
+
+    message = FakeInfoMessage(777, deletable=False)
+    _run(bot.on_message(message))
+    assert message.deleted is False
+
+
+def test_bot_messages_and_other_channels_reach_commands(monkeypatch):
+    import astral_relay.agent.discord_setup as setup
+
+    monkeypatch.setattr(setup, "is_info_channel", lambda channel_id: channel_id == 777)
+    bot = bot_mod.build_bot(_config())
+    processed = []
+
+    async def fake_process(message):
+        processed.append(message)
+
+    monkeypatch.setattr(bot, "process_commands", fake_process)
+
+    bot_echo = FakeInfoMessage(777, bot_author=True)  # our own panel message
+    elsewhere = FakeInfoMessage(42)
+    _run(bot.on_message(bot_echo))
+    _run(bot.on_message(elsewhere))
+    assert bot_echo.deleted is False
+    assert elsewhere.deleted is False
+    assert processed == [bot_echo, elsewhere]

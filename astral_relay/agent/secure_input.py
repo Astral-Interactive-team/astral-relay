@@ -117,20 +117,30 @@ def _styled_line(text: str, enabled: bool) -> str:
     return buffer.getvalue()
 
 
-def prompt_for_token(output_stream=None) -> str:
-    """Prompt for the bot token with void header. Trims, rejects empty. Never prints value."""
+def prompt_for_token(output_stream=None, show_header: bool = True) -> str:
+    """Prompt for the bot token with void header. Trims, rejects empty. Never prints value.
+
+    `show_header` prints the void-style header plus `└── >> ` prefix.
+    Callers that already keep the menu prompt on screen (the interactive
+    generate step) pass False so only a single prompt block is visible;
+    the token line then mirrors the plain exe-name prompt.
+    """
     from astral_relay.cli.theme import supports_color
 
     out = output_stream if output_stream is not None else sys.stderr
     enabled = supports_color()
-    prefix = void_prompt("Discord Bot Token")
+    if show_header:
+        prefix = void_prompt("[Discord Bot Token]")
+        prompt_text = _styled_line(void_header() + "\n", enabled) + _styled_line(prefix, enabled)
+    else:
+        prefix = "[Discord Bot Token]: "
+        prompt_text = _styled_line(prefix, enabled)
     try:
-        out.write(_styled_line(void_header() + "\n", enabled))
-        out.write(_styled_line(prefix, enabled))
+        out.write(prompt_text)
         out.flush()
     except (OSError, ValueError):
         pass
-    token = read_secure_line(prefix=_styled_line(prefix, enabled), output_stream=out).strip()
+    token = read_secure_line(prefix=prefix, output_stream=out).strip()
     if token == "":
         raise ValueError("Empty token rejected. Paste a bot token from the Discord developer portal.")
     if token.lower() == "q":

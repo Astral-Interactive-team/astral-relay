@@ -1,13 +1,16 @@
 # Integration tests: payload codegen roundtrip and CLI smoke.
 # No network. No PyInstaller. No production artifact writes.
 
+import os
 import subprocess
 import sys
+from pathlib import Path
 
-from astral_relay.agent.payload import load_embedded_payload
 from astral_relay.builder.payload_codegen import render_payload_module
 from astral_relay.shared.config import default_runtime_config
 from tests.python.unit.test_payload import TOKEN_A
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_codegen_module_loads_through_import(tmp_path, monkeypatch):
@@ -26,7 +29,7 @@ def test_cli_version_smoke():
     proc = subprocess.run(
         [sys.executable, "-m", "astral_relay", "--version"],
         capture_output=True, text=True, timeout=60, shell=False,
-        env={**__import__("os").environ, "PYTHONPATH": "src"},
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
     )
     assert proc.returncode == 0
     assert "astral-relay" in proc.stdout.lower()

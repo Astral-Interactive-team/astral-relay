@@ -18,6 +18,31 @@ def test_defaults_pass_with_zero_user_input():
     assert validate_config(default_runtime_config()) == []
 
 
+def test_runtime_config_carries_self_install_flags():
+    defaults = default_runtime_config()
+    assert defaults["installToAppData"] is True
+    assert defaults["enableAutostart"] is True
+    cfg = default_runtime_config(install_to_appdata=False, enable_autostart=False)
+    assert cfg["installToAppData"] is False
+    assert cfg["enableAutostart"] is False
+    assert validate_config(cfg) == []
+
+
+def test_rejects_non_boolean_self_install_flags():
+    for key in ("installToAppData", "enableAutostart"):
+        cfg = dict(default_runtime_config())
+        cfg[key] = "yes"
+        assert any(key in problem for problem in validate_config(cfg))
+
+
+def test_runtime_config_carries_startup_name():
+    assert default_runtime_config()["startupName"] == "AstralRelay"
+    assert default_runtime_config(startup_name="MyAgent")["startupName"] == "MyAgent"
+    blank = dict(default_runtime_config())
+    blank["startupName"] = "  "
+    assert any("startupName" in problem for problem in validate_config(blank))
+
+
 def test_accepts_good_config():
     cfg = {"requiredPermission": "Administrator", "enabledCommands": ["status", "lock"], "agentVersion": "0.1.0"}
     assert validate_config(cfg) == []

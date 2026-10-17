@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="astral-relay", description="Build and run AstralRelay Agent EXE.")
     parser.add_argument("--version", "-v", action="store_true", help="Print version and exit.")
     sub = parser.add_subparsers(dest="command")
-    build_cmd = sub.add_parser("build", help="Generate dist/AstralRelay-Agent.exe.")
+    build_cmd = sub.add_parser("build", help="Generate dist/astral-relay.exe.")
     build_cmd.add_argument("--version", "-v", action="store_true", help="Print version and exit.")
     return parser
 

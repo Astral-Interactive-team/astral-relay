@@ -1,8 +1,10 @@
-# Unit tests for Windows info formatting and session lock handling.
+# Unit tests for Windows info formatting (the !pc status reply) and session
+# lock handling. The full #info dashboard lives in info_report.py and has its
+# own test module.
 
 import pytest
 
-from astral_relay.agent.windows.info import format_status, get_status
+from astral_relay.agent.windows.info import format_status, get_status, get_uptime_seconds
 from astral_relay.agent.windows.lock import lock_session
 
 
@@ -18,6 +20,12 @@ def test_status_snapshot_and_format():
     assert "Agent: v0.1.0" in text
     assert "Uptime:" in text
     assert format_status(get_status("0.1.0", False)).startswith("Status: starting")
+
+
+def test_uptime_helper_is_monotonic_and_non_negative():
+    assert isinstance(get_uptime_seconds(), int)
+    assert get_uptime_seconds() >= 0
+    assert get_status("1.2.3", True)["uptimeSeconds"] == get_uptime_seconds()
 
 
 def test_machine_id_short_and_stable():

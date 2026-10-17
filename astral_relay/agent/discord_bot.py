@@ -3,10 +3,14 @@
 # Commands use the ! prefix through a `pc` group: !pc status, !pc apps,
 # !pc open <id>, !pc lock. No slash commands, no CommandTree, no
 # application-command registration or synchronization live here; obsolete
-# slash commands are removed once by scripts/clear_slash_commands.py.
+# slash commands are removed manually from the Discord Developer Portal.
 # Every routing path calls require_authorized before any Windows
 # operation. Prefix replies are ordinary messages, so failure text stays
 # generic and never carries system details.
+# on_message deletes member messages posted in a managed #info channel and
+# then hands the event to discord.py's prefix-command processor; because
+# this listener overrides the default, process_commands is always called.
+# on_resumed counts gateway session resumes for the #info agent section.
 
 from __future__ import annotations
 
@@ -36,6 +40,9 @@ def build_bot(config: dict, catalog_fn=None):
     intents.message_content = True
 
     bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, case_insensitive=True, help_command=None)
+    # Gateway session resumes are counted here so the #info report can
+    # show a real reconnect count instead of a placeholder.
+    bot._astral_reconnects = 0
     discover = catalog_fn if catalog_fn is not None else discover_catalog
 
     def auth_source_of(ctx) -> dict[str, Any]:
@@ -87,10 +94,41 @@ def build_bot(config: dict, catalog_fn=None):
         from astral_relay.agent.windows.info import get_hostname, get_machine_id
 
         try:
-            await ensure_host_categories(bot, get_hostname(), get_machine_id())
+            await ensure_host_categories(bot, get_hostname(), get_machine_id(), config=config)
         except Exception:
             pass
         info("Discord client ready.")
+
+    @bot.event
+    async def on_resumed() -> None:
+        """Count gateway session resumes for the #info agent section."""
+        bot._astral_reconnects = int(getattr(bot, "_astral_reconnects", 0)) + 1
+
+    @bot.event
+    async def on_message(message) -> None:
+        """Delete member chatter in managed #info channels, then route commands.
+
+        The information channel is bot-owned, so member messages sent there
+        are removed immediately and never reach the command processor. If
+        deletion is not permitted the message is left in place. Bot
+        messages and every other channel fall through to the regular
+        prefix-command processor.
+        """
+        from astral_relay.agent.discord_setup import is_info_channel
+
+        member_post = not getattr(getattr(message, "author", None), "bot", False)
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        try:
+            info_channel = member_post and is_info_channel(channel_id)
+        except Exception:
+            info_channel = False
+        if info_channel:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+        await bot.process_commands(message)
 
     @bot.event
     async def on_command_error(ctx, exc) -> None:

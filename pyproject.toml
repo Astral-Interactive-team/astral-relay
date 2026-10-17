@@ -19,11 +19,12 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["astral_relay*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
-pythonpath = ["src"]
+pythonpath = ["."]
 
 [tool.astral_relay]
 agent_version = "0.1.0"

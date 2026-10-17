@@ -2,9 +2,7 @@
 # Mirrors tests/apps.test.js using synthetic shortcut bytes plus temp dirs.
 
 import base64
-import os
 import struct
-from pathlib import Path
 
 import pytest
 

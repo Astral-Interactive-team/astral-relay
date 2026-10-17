@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import struct
 import subprocess
 from pathlib import Path
@@ -342,7 +343,7 @@ def launch_app(entry: dict, spawn_fn=None) -> str:
     if entry.get("target") is None or entry.get("unresolved") is True:
         raise ValueError(f"\"{entry.get('name') or 'app'}\" path could not be resolved reliably. Not launching.")
     target = str(entry.get("target") or "").replace("/", "\\")
-    if not __import__("re").match(r"^[A-Za-z]:\\", target) or ".." in target or not target.lower().endswith(EXE_EXT):
+    if not re.match(r"^[A-Za-z]:\\", target) or ".." in target or not target.lower().endswith(EXE_EXT):
         raise ValueError(f"Blocked unsafe target for \"{entry.get('name') or 'app'}\".")
     if not Path(target).is_file():
         raise ValueError(f"\"{entry.get('name') or 'app'}\" target missing on this PC.")

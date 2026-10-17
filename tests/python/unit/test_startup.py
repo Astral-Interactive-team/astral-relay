@@ -4,8 +4,7 @@
 import sys
 from pathlib import Path
 
-import astral_relay.agent.startup as startup_mod
-from astral_relay.agent.startup import RUN_KEY, VALUE_NAME, ensure_autorun
+from astral_relay.agent.startup import DEFAULT_STARTUP_NAME, RUN_KEY, ensure_autorun
 
 
 class FakeWinreg:
@@ -57,10 +56,10 @@ def test_added_current_updated(monkeypatch):
     fake = FakeWinreg()
     monkeypatch.setitem(sys_mod.modules, "winreg", fake)
     assert ensure_autorun("C:\\app.exe") == "added"
-    assert fake.values[VALUE_NAME] == '"C:\\app.exe"'
+    assert fake.values[DEFAULT_STARTUP_NAME] == '"C:\\app.exe"'
     assert ensure_autorun("C:\\app.exe") == "current"
     assert ensure_autorun("D:\\new.exe") == "updated"
-    assert fake.values[VALUE_NAME] == '"D:\\new.exe"'
+    assert fake.values[DEFAULT_STARTUP_NAME] == '"D:\\new.exe"'
 
 
 def test_terminate_holders_contract():
@@ -143,6 +142,161 @@ def test_backup_skipped_when_not_frozen(monkeypatch):
     assert ensure_backup_copy() == ("skipped", None)
 
 
+def test_self_install_honors_build_flags(monkeypatch):
+    import astral_relay.agent.startup as startup
+
+    calls = []
+
+    def fake_backup(exe_path=None, startup_name=None):
+        calls.append(("backup", startup_name))
+        return "installed", r"C:\backup.exe"
+
+    def fake_autorun(exe_path=None, value_name=None):
+        calls.append(("autorun", exe_path, value_name))
+        return "added"
+
+    def fake_task(exe_path, task_name=None):
+        calls.append(("task", exe_path, task_name))
+        return "added"
+
+    monkeypatch.setattr(startup, "ensure_backup_copy", fake_backup)
+    monkeypatch.setattr(startup, "ensure_autorun", fake_autorun)
+    monkeypatch.setattr(startup, "ensure_logon_task", fake_task)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    # Both enabled: copy first, autostart targets the backup copy with the build name.
+    startup.apply_self_install(
+        {"installToAppData": True, "enableAutostart": True, "startupName": "MyAgent"}
+    )
+    assert ("backup", "MyAgent") in calls
+    assert ("autorun", r"C:\backup.exe", "MyAgent") in calls
+    assert ("task", r"C:\backup.exe", "MyAgent") in calls
+
+    # Copy off, autostart on: autostart targets the running EXE.
+    calls.clear()
+    startup.apply_self_install({"installToAppData": False, "enableAutostart": True})
+    assert all(entry[0] != "backup" for entry in calls)
+    assert ("autorun", sys.executable, None) in calls
+    assert ("task", sys.executable, None) in calls
+
+    # Both off: nothing happens.
+    calls.clear()
+    startup.apply_self_install({"installToAppData": False, "enableAutostart": False})
+    assert calls == []
+
+    # Missing keys keep the original enabled behavior.
+    calls.clear()
+    startup.apply_self_install({})
+    assert ("backup", None) in calls
+
+
+def test_self_install_skips_registry_when_not_frozen(monkeypatch):
+    import astral_relay.agent.startup as startup
+
+    calls = []
+    monkeypatch.setattr(startup, "ensure_backup_copy", lambda exe_path=None, startup_name=None: ("skipped", None))
+    monkeypatch.setattr(startup, "ensure_autorun", lambda exe_path=None, value_name=None: calls.append("autorun") or "added")
+    monkeypatch.setattr(startup, "ensure_logon_task", lambda exe_path, task_name=None: calls.append("task") or "added")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+
+    result = startup.apply_self_install({"installToAppData": True, "enableAutostart": True})
+    assert calls == []
+    assert result["autorun"] == "skipped"
+    assert result["logonTask"] == "skipped"
+
+
+def test_startup_name_drives_folder_and_registry(tmp_path, monkeypatch):
+    import sys as sys_mod
+
+    from astral_relay.agent.startup import backup_paths, ensure_autorun
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roam"))
+    directory, dst = backup_paths(startup_name="MyAgent")
+    assert directory.name == "MyAgent"
+    assert dst.name == "AstralRelay-Agent.exe"
+
+    monkeypatch.setattr(sys_mod, "frozen", True, raising=False)
+    fake = FakeWinreg()
+    monkeypatch.setitem(sys_mod.modules, "winreg", fake)
+    assert ensure_autorun("C:\\app.exe", value_name="MyAgent") == "added"
+    assert fake.values["MyAgent"] == '"C:\\app.exe"'
+    assert ensure_autorun("C:\\app.exe", value_name="MyAgent") == "current"
+
+
+def test_read_registration_reports_state_read_only(tmp_path, monkeypatch):
+    import subprocess as subprocess_mod
+    import sys as sys_mod
+
+    from astral_relay.agent.startup import read_registration
+
+    env = {"APPDATA": str(tmp_path / "roam")}
+    fake = FakeWinreg({"astral-relay": '"C:\\app.exe"'})
+    monkeypatch.setitem(sys_mod.modules, "winreg", fake)
+    calls = []
+
+    class Proc:
+        returncode = 0
+
+    monkeypatch.setattr(subprocess_mod, "run", lambda cmd, **kwargs: calls.append(cmd) or Proc())
+
+    result = read_registration("astral-relay", env=env)
+    assert result["valueName"] == "astral-relay"
+    assert result["runKey"] == "registered"
+    assert result["runCommand"] == '"C:\\app.exe"'
+    assert result["logonTask"] == "present"
+    assert result["backupPath"] is not None
+    assert result["backupPresent"] is False
+    assert fake.writes == []  # read-only: nothing is created or changed
+    assert any("/query" in part for command in calls for part in command)
+
+
+def test_read_registration_handles_missing_value_and_denied_registry(tmp_path, monkeypatch):
+    import sys as sys_mod
+
+    from astral_relay.agent.startup import read_registration
+
+    env = {"APPDATA": str(tmp_path / "roam")}
+    monkeypatch.setitem(sys_mod.modules, "winreg", FakeWinreg())
+    assert read_registration("astral-relay", env=env)["runKey"] == "missing"
+
+    class DeniedWinreg(FakeWinreg):
+        def OpenKey(self, root, path, reserved=0, access=0):
+            raise OSError("denied")
+
+    monkeypatch.setitem(sys_mod.modules, "winreg", DeniedWinreg())
+    assert read_registration("astral-relay", env=env)["runKey"] == "unavailable"
+
+
+def test_read_registration_marks_an_absent_task(tmp_path, monkeypatch):
+    import subprocess as subprocess_mod
+    import sys as sys_mod
+
+    from astral_relay.agent.startup import read_registration
+
+    monkeypatch.setitem(sys_mod.modules, "winreg", FakeWinreg())
+
+    class Proc:
+        returncode = 1
+
+    monkeypatch.setattr(subprocess_mod, "run", lambda cmd, **kwargs: Proc())
+    assert read_registration("astral-relay", env={"APPDATA": str(tmp_path)})["logonTask"] == "absent"
+
+
+def test_read_registration_survives_a_missing_task_command(tmp_path, monkeypatch):
+    import subprocess as subprocess_mod
+    import sys as sys_mod
+
+    from astral_relay.agent.startup import read_registration
+
+    monkeypatch.setitem(sys_mod.modules, "winreg", FakeWinreg())
+
+    def boom(cmd, **kwargs):
+        raise OSError("schtasks not found")
+
+    monkeypatch.setattr(subprocess_mod, "run", boom)
+    assert read_registration("astral-relay", env={"APPDATA": str(tmp_path)})["logonTask"] == "unknown"
+
+
 def test_logon_task_registers_once(monkeypatch):
     import subprocess as subprocess_mod
 
@@ -163,6 +317,10 @@ def test_logon_task_registers_once(monkeypatch):
     monkeypatch.setattr(subprocess_mod, "run", fake_run)
     assert ensure_logon_task("C:\\a.exe") == "added"
     assert any("/create" in c for c in calls)
+
+    calls.clear()
+    assert ensure_logon_task("C:\\a.exe", task_name="MyAgent") == "added"
+    assert any("MyAgent" in part for c in calls for part in c)
 
     def fake_run_exists(cmd, **kwargs):
         return Proc(0)

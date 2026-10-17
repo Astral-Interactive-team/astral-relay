@@ -1,7 +1,9 @@
-# Read-only host facts for !pc status replies.
+# Read-only host facts for !pc status replies and the managed #info channel.
 # Returns connection state, platform, architecture, agent version,
 # hostname, and uptime. The hostname lets the operator tell managed
-# computers apart. Still exposes no usernames, SIDs, or local paths.
+# computers apart. format_status renders the compact reply for !pc status;
+# the full #info dashboard is built from windows/inventory.py. Still
+# exposes no usernames, SIDs, or local paths.
 
 from __future__ import annotations
 
@@ -67,6 +69,11 @@ def get_machine_id() -> str:
     return short or "unknown-id"
 
 
+def get_uptime_seconds() -> int:
+    """Return whole seconds since this Agent process started."""
+    return int(time.monotonic() - _START)
+
+
 def get_status(agent_version: str, connected: bool) -> dict:
     """Build a status snapshot. Pure, safe to call on every command."""
     uname = platform.uname()
@@ -79,7 +86,7 @@ def get_status(agent_version: str, connected: bool) -> dict:
         "hostname": get_hostname(),
         "hostId": get_machine_id(),
         "localIp": get_local_ip(),
-        "uptimeSeconds": int(time.monotonic() - _START),
+        "uptimeSeconds": get_uptime_seconds(),
     }
 
 

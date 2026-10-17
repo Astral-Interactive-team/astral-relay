@@ -44,7 +44,7 @@ Astral Relay provides a custom terminal interface with Astral Interactive brandi
 | HOME | GitHub, Telegram, Discord |
 | RELAY | Generate Agent EXE, Start Agent |
 
-The startup banner is stored in `banner.txt`. The development CLI and production Agent use separate entry points.
+The startup banner is stored in `astral_relay/cli/banner.txt`. The development CLI and production Agent use separate entry points.
 
 ### Discord Agent
 
@@ -59,6 +59,12 @@ The Agent connects to Discord and processes supported prefix commands.
 | `!pc lock` | Lock the current Windows session |
 
 Commands are case-insensitive. For example, `!PC STATUS` is equivalent to `!pc status`.
+
+### System Information Dashboard
+
+Each managed computer publishes a full system report to its managed `#info` channel using Discord **Components V2**. The report is read-only and lists device identity, Windows/OS, CPU, memory, graphics, firmware, storage, network, power, security, installed software, processes, services, performance counters, environment availability, and Agent state.
+
+There are no select menus, no pagination buttons, and no repeat commands. When the report does not fit in one message it continues in additional messages that are appended in order. Nothing is summarized or omitted, and facts the Agent cannot read are reported as `Unavailable` or `Not supported` instead of being guessed. See [System Report](#system-report) for what is and is not collected.
 
 ### Windows Application Discovery
 
@@ -78,7 +84,7 @@ Generated executable:
 
 ```text
 dist/
-└── AstralRelay-Agent.exe
+└── astral-relay.exe
 ```
 
 If the build fails verification, the previous executable is preserved.
@@ -106,21 +112,26 @@ cd astral-relay
 
 Alternatively, download and extract the source ZIP from the download link above.
 
-### 2. Create a virtual environment
+### 2. Create a virtual environment (recommended)
 
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
+A virtual environment is recommended but not required.
+
 ### 3. Install dependencies
 
 ```powershell
-python -m pip install -r requirements.lock
-python -m pip install --no-deps -e .
+python -m pip install -r requirements.txt
 ```
 
-The editable installation makes the `src/astral_relay` package importable from the active environment.
+The `astral_relay` package lives at the repository root, so `python -m astral_relay` runs directly with any Python 3.14 interpreter that has these dependencies, without installing the package. To also run it from other directories, install it editable:
+
+```powershell
+python -m pip install --no-deps -e .
+```
 
 ### 4. Launch Astral Relay
 
@@ -128,7 +139,7 @@ The editable installation makes the `src/astral_relay` package importable from t
 python -m astral_relay
 ```
 
-No global installation or PATH modification is required.
+Run the command from the repository root. No package installation, global installation, or PATH modification is required.
 
 ## Usage
 
@@ -147,6 +158,17 @@ Available menu actions:
 | `N` | Open the RELAY page |
 | `B` | Return to HOME |
 | `Q` | Exit |
+
+Generating an Agent (option `01`, or `python scripts/build_exe.py`) prompts for:
+
+| Prompt | Default | Effect |
+|:--|:--|:--|
+| Discord Bot Token | required | Embedded in the EXE as recoverable data. |
+| Output EXE name | `astral-relay.exe` | Published under `dist/`. |
+| Copy Agent into `%APPDATA%` | Yes | The EXE copies itself to `%APPDATA%\<name>\AstralRelay-Agent.exe` on launch so deleting the original keeps autostart working. |
+| Register Windows autostart | Yes | The EXE registers `HKCU Run` and a logon task on launch. |
+
+`<name>` is the output EXE name without its extension (for example `astral-relay`, or `MyAgent` for `MyAgent.exe`); the same name is used for the `%APPDATA%` folder, the `HKCU Run` value, and the logon task. Both install choices are embedded in the EXE at build time and are not asked on the target PC.
 
 Display the version:
 
@@ -175,7 +197,7 @@ The final output is:
 
 ```text
 dist/
-└── AstralRelay-Agent.exe
+└── astral-relay.exe
 ```
 
 The builder publishes the new executable only after verification succeeds and preserves the previous output when a build fails.
@@ -193,6 +215,8 @@ Enable the intent in both:
 1. The Agent's Discord intent configuration.
 2. Discord Developer Portal → Application → Bot → Privileged Gateway Intents.
 
+The bot also needs **Manage Channels** to create the managed category and its `#info` channel, and **Manage Messages** to clear member messages posted in `#info`.
+
 ### Access Control
 
 - Commands require a valid Discord guild context.
@@ -201,15 +225,50 @@ Enable the intent in both:
 - Missing or invalid permission configuration fails closed.
 - Authorization is checked before Windows operations.
 
-Previously registered `/pc` slash commands may remain available until explicitly removed.
+Previously registered `/pc` slash commands may remain visible in Discord until removed.
 
-To remove old slash-command registrations, review and run:
+The Agent no longer ships a removal script. Remove old registrations manually from the **Discord Developer Portal** (Application → Commands) if they still appear. This is an explicit operator action and never runs automatically during startup.
 
-```powershell
-python scripts/clear_slash_commands.py
-```
+### Managed Categories
 
-This is an explicit operator action and should not run automatically during startup.
+Each Agent installation manages exactly one category per guild.
+
+- A random, non-secret **installation ID** is generated once and stored at `%LOCALAPPDATA%\AstralRelay\identity.json`, beside the sanitized error log.
+- The category is named `<hostname> [<installation-id>]` and matched by that installation ID, so restarts, reconnects, and repeated `on_ready` events reuse the same category instead of creating more. The created category ID is remembered in the same file.
+- Missing `Manage Channels` permission or Discord API failures warn once and are not retried in a loop.
+- Categories left by older builds (`pc <hostname> (<host-id>)`) are adopted when unambiguous. Ambiguous or duplicate categories are reported to the file log and never deleted automatically.
+
+Channels are added to the managed category one at a time, starting with `#info`:
+
+- The bot creates a single `#info` text channel inside the category and publishes this computer's full system report there using Discord **Components V2** (no embeds, no select menus, no pagination). The channel ID and the ordered report message IDs are remembered in `identity.json`, so later starts refresh the same messages instead of posting duplicates.
+- The report lists every collected fact from top to bottom. When it does not fit in one message, it continues in additional messages that are appended in order; sections that span a message boundary repeat their heading with `(continued)`.
+- Long lists are never summarized or truncated: every installed application, every running process, and every service is listed.
+- Values the Agent genuinely cannot read are shown as `Unavailable`, and features the platform does not expose are shown as `Not supported`. No placeholder numbers are invented.
+- Member messages posted in `#info` are deleted immediately, and are never treated as commands. Bots and members can keep using `!pc ...` in the category's other channels.
+
+### System Report
+
+The report is produced by two modules:
+
+- `astral_relay/agent/windows/inventory.py` collects the facts with read-only registry reads, ctypes calls, the existing Start Menu catalog, and a single base64-encoded PowerShell CIM pass. Each probe is guarded, so a partial failure only marks its own fields `Unavailable`.
+- `astral_relay/agent/info_report.py` renders, splits, and publishes the Components V2 messages.
+
+Collected sections: device identity, Windows/OS, CPU, memory (with modules and page file), graphics and displays, motherboard/BIOS/TPM/Secure Boot, storage (logical volumes, physical disks, health, BitLocker), network (per adapter), power and battery, Windows security and updates, installed software, processes and services, live performance counters, system directories and environment availability, and Agent state.
+
+What the collector deliberately does not read or send:
+
+- No tokens, passwords, product keys, cookies, credentials, clipboard contents, keystrokes, audio, camera, screen captures, file contents, or process memory.
+- Only the Windows **Product ID** is read; the product key is never touched.
+- Disk, service, BitLocker, TPM, and Defender probes are read-only.
+- Process command lines and environment-variable values are never read; the environment section reports only which directories exist.
+
+The only outbound request is one short-timeout HTTPS lookup of the public IPv4 address (`api.ipify.org`, falling back to `icanhazip.com`). It sends no credentials and no identifiers beyond the HTTP request itself. If it fails, the field shows `Unavailable`.
+
+Two fields are inferred rather than reported by Windows directly, and are documented here so they are not mistaken for first-hand facts:
+
+- **BIOS mode** is inferred from the presence of the Secure Boot state registry key (`HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State`): present means `UEFI`, otherwise `Legacy BIOS`.
+- **Internet connectivity** comes from whether the public-IPv4 lookup succeeded; when the lookup fails but the endpoint is still reachable, the field says so explicitly instead of claiming full connectivity.
+
 
 ## Security
 
@@ -228,7 +287,7 @@ Recommended precautions:
 - Review the Agent's automatic-start behavior before deployment.
 - Run the Agent only on systems you own or are authorized to administer.
 
-The current production implementation registers Windows automatic-start mechanisms through `HKCU Run` and a logon task, with a backup copy under `%APPDATA%\AstralRelay`.
+Windows persistence is chosen at build time. When enabled, the EXE copies itself into `%APPDATA%\<name>` (named after the output EXE without its extension) and registers automatic start through `HKCU Run` plus a logon task using the same name. Disable either the `%APPDATA%` copy or autostart while building if that behavior is not wanted.
 
 The Agent runs without a visible console window. Understand these behaviors before launching it or distributing the executable.
 
@@ -249,7 +308,7 @@ $env:ASTRAL_RUN_PACKAGING = "1"
 python -m pytest tests/python/packaging -q
 ```
 
-The automated tests cover configuration validation, authorization, application discovery, process-launch restrictions, payload handling, output redaction, and packaging behavior.
+The automated tests cover configuration validation, authorization, application discovery, process-launch restrictions, payload handling, per-installation category management, output redaction, and packaging behavior.
 
 Tests using mocks or test credentials do not prove that live Discord authentication, all Windows operations, or every startup behavior works correctly.
 
@@ -262,6 +321,8 @@ Tests using mocks or test credentials do not prove that live Discord authenticat
 - Each token-specific build currently requires a full PyInstaller rebuild.
 - The embedded bot token can be extracted from the executable.
 - Automatic-start behavior should be reviewed before wider deployment.
+- The system report is published only to managed `#info` channels and is not exposed as a prefix command.
+- Report updates happen when the Agent starts; deleting a report message makes the Agent repost it on the next start.
 
 ## Project Status
 
@@ -280,23 +341,21 @@ Astral Relay remains experimental until live Discord integration and target-Wind
 
 ```text
 astral-relay/
-├── src/
-│   └── astral_relay/
-│       ├── cli/
-│       ├── shared/
-│       ├── agent/
-│       └── builder/
+├── astral_relay/
+│   ├── cli/
+│   │   └── banner.txt
+│   ├── shared/
+│   ├── agent/
+│   └── builder/
 ├── tests/
 │   └── python/
 │       ├── unit/
 │       ├── integration/
 │       └── packaging/
 ├── scripts/
-│   ├── build_exe.py
-│   └── clear_slash_commands.py
-├── banner.txt
+│   └── build_exe.py
 ├── pyproject.toml
-├── requirements.lock
+├── requirements.txt
 └── README.md
 ```
 

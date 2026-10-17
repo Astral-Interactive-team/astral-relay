@@ -3,7 +3,6 @@
 
 import sys
 
-import astral_relay.agent.app as app_mod
 from astral_relay.agent.app import (
     EXIT_BAD_CONFIG,
     EXIT_BAD_TOKEN,

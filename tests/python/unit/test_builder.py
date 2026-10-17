@@ -1,14 +1,12 @@
 # Unit tests for builder codegen validation, staging isolation, and
 # atomic publish behavior. Never runs PyInstaller here.
 
-import os
 from pathlib import Path
 
 import pytest
 
 import astral_relay.builder.build as build_mod
 from astral_relay.builder.build import archive_stale_output, resolve_build_token
-from astral_relay.shared.config import default_runtime_config
 from astral_relay.shared.errors import BuildError
 from tests.python.unit.test_payload import TOKEN_A
 
@@ -64,6 +62,32 @@ def test_prompt_exe_name_default_and_invalid(monkeypatch, capsys):
     assert build_mod.prompt_exe_name() == "Custom.exe"
 
 
+def test_prompt_exe_name_is_themed_on_tty(monkeypatch):
+    import io
+    import sys as sys_mod
+
+    from astral_relay.builder import build as build_mod
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    class Answer(io.StringIO):
+        def isatty(self):
+            return False
+
+    out = Tty()
+    monkeypatch.setattr(sys_mod, "stdout", out)
+    monkeypatch.setattr(sys_mod, "stdin", Answer("Custom\n"))
+    assert build_mod.prompt_exe_name() == "Custom.exe"
+    written = out.getvalue()
+    assert "\x1b[" in written  # purple ANSI styling applied
+    import re
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", written)
+    assert plain == f"[Output EXE name] (default: {build_mod.DEFAULT_EXE_NAME}): "
+
+
 def test_resolve_token_validates_before_work():
     calls = []
     with pytest.raises(BuildError):
@@ -72,16 +96,55 @@ def test_resolve_token_validates_before_work():
     assert resolve_build_token(token="  " + TOKEN_A + " ", prompt_token=lambda: (_ for _ in ()).throw(AssertionError())) == TOKEN_A
 
 
+def test_prompt_bool_parses_answers(monkeypatch):
+    import io
+
+    def answer(text):
+        monkeypatch.setattr(build_mod.sys, "stdin", io.StringIO(text))
+        return build_mod.prompt_bool("Test", default=True)
+
+    assert answer("y\n") is True
+    assert answer("YES\n") is True
+    assert answer("n\n") is False
+    assert answer("no\n") is False
+    assert answer("\n") is True
+    assert answer("maybe\n") is True
+
+
+def test_prompt_bool_empty_keeps_false_default(monkeypatch):
+    import io
+
+    monkeypatch.setattr(build_mod.sys, "stdin", io.StringIO("\n"))
+    assert build_mod.prompt_bool("Test", default=False) is False
+
+
 def test_staging_copy_excludes_real_tree(tmp_path, monkeypatch):
-    monkeypatch.setattr(build_mod, "SRC_PACKAGE", Path("src/astral_relay"))
+    monkeypatch.setattr(build_mod, "SRC_PACKAGE", Path("astral_relay"))
     monkeypatch.setattr(build_mod, "BUILD_TMP", tmp_path)
     stage = build_mod._stage_package()
     try:
         assert (stage / "pkg" / "run_agent.py").is_file()
         assert not (stage / "pkg" / "astral_relay" / "_embedded_payload.py").exists()
-        assert Path("src/astral_relay/_embedded_payload.py").exists() is False
+        assert Path("astral_relay/_embedded_payload.py").exists() is False
     finally:
         build_mod._cleanup_tracked()
+
+
+def test_ensure_pyinstaller_reports_missing(monkeypatch):
+    monkeypatch.setattr(build_mod.importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(BuildError) as excinfo:
+        build_mod._ensure_pyinstaller()
+    assert "requirements.txt" in str(excinfo.value)
+
+
+def test_build_agent_fails_fast_without_pyinstaller(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_mod, "DIST_DIR", tmp_path / "dist")
+    monkeypatch.setattr(build_mod, "BUILD_TMP", tmp_path / "build-tmp")
+    monkeypatch.setattr(build_mod.importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(BuildError) as excinfo:
+        build_mod.build_agent(token=TOKEN_A)
+    assert "requirements.txt" in str(excinfo.value)
+    assert not (tmp_path / "build-tmp").exists()
 
 
 def test_archive_stale_output(tmp_path):
@@ -133,7 +196,7 @@ def test_generate_cancel_returns_to_menu(monkeypatch):
         raise KeyboardInterrupt()
 
     monkeypatch.setattr(build_mod, "build_agent", cancelled)
-    monkeypatch.setattr(build_mod, "prompt_build_token", lambda: TOKEN_A)
+    monkeypatch.setattr(build_mod, "prompt_build_token", lambda **kwargs: TOKEN_A)
     stdin = _FakePipe()
     monkeypatch.setattr(sys, "stdin", stdin)
     console = Console(file=_FakePipe(), force_terminal=False, no_color=True)

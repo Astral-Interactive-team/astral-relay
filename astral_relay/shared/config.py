@@ -13,6 +13,7 @@ from astral_relay.shared.errors import ConfigError
 
 VALID_COMMANDS = ["status", "open", "apps", "lock"]
 DEFAULT_PERMISSION = "ManageGuild"
+DEFAULT_STARTUP_NAME = "AstralRelay"
 
 PERMISSION_NOTES = {
     "Administrator": "Full server ownership: holders already control roles, bots, and settings. Widest access.",
@@ -54,12 +55,23 @@ def permission_note(name: str) -> str | None:
     return PERMISSION_NOTES.get(name)
 
 
-def default_runtime_config() -> dict[str, Any]:
-    """Return the default non-secret runtime config embedded by the builder."""
+def default_runtime_config(install_to_appdata: bool = True, enable_autostart: bool = True,
+                           startup_name: str = DEFAULT_STARTUP_NAME) -> dict[str, Any]:
+    """Return the default non-secret runtime config embedded by the builder.
+
+    `install_to_appdata` and `enable_autostart` are the build-time choices
+    for the EXE's self-install behavior; both default to enabled.
+    `startup_name` names the `%APPDATA%` subfolder and the autostart
+    registry value and logon task.
+    """
+    name = str(startup_name).strip() or DEFAULT_STARTUP_NAME
     return {
         "requiredPermission": DEFAULT_PERMISSION,
         "enabledCommands": ["status", "open", "apps", "lock"],
         "agentVersion": AGENT_VERSION,
+        "installToAppData": bool(install_to_appdata),
+        "enableAutostart": bool(enable_autostart),
+        "startupName": name,
     }
 
 
@@ -80,6 +92,11 @@ def validate_config(raw: Any) -> list[str]:
                 break
     if not isinstance(raw.get("agentVersion"), str) or raw.get("agentVersion") == "":
         problems.append("agentVersion must be a non-empty string.")
+    for flag in ("installToAppData", "enableAutostart"):
+        if flag in raw and not isinstance(raw[flag], bool):
+            problems.append(f"{flag} must be true or false.")
+    if "startupName" in raw and (not isinstance(raw["startupName"], str) or raw["startupName"].strip() == ""):
+        problems.append("startupName must be a non-empty string.")
     for legacy in _LEGACY_KEYS:
         if legacy in raw:
             problems.append(f"{legacy} was removed. Rebuild the EXE; no configuration file is used.")

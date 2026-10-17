@@ -59,7 +59,7 @@ def test_is_interactive_requires_both_ttys(monkeypatch):
     assert is_interactive(out_tty) is False
 
 
-def _run_with_streams(stdin_text, stdout_stream, monkeypatch):
+def _run_with_streams(stdin_text, stdout_stream, monkeypatch, patch_sleep=True):
     stdin = FakeTTY()
     stdin.write(stdin_text)
     stdin.seek(0)
@@ -76,6 +76,12 @@ def _run_with_streams(stdin_text, stdout_stream, monkeypatch):
     stdin.readline = echoing_readline
     monkeypatch.setattr(sys, "stdin", stdin)
     monkeypatch.setattr(sys, "stdout", stdout_stream)
+    # Skip the interactive blank-screen startup hold so redraw assertions
+    # run instantly; the hold itself is asserted separately.
+    import astral_relay.cli.menu as menu_mod
+
+    if patch_sleep:
+        monkeypatch.setattr(menu_mod.time, "sleep", lambda seconds: None)
     return run_menu()
 
 
@@ -140,6 +146,61 @@ def test_interactive_uses_alternate_screen(monkeypatch):
     raw = out.getvalue()
     assert "\x1b[?1049h" in raw  # alt screen entered
     assert "\x1b[?1049l" in raw  # alt screen restored on exit
+
+
+def test_interactive_blank_hold_before_first_paint(monkeypatch):
+    """Interactive startup holds a blank screen; pipes skip the wait."""
+    import astral_relay.cli.menu as menu_mod
+
+    slept = []
+    out = FakeTTY()
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    monkeypatch.setattr(menu_mod.time, "sleep", lambda seconds: slept.append(seconds))
+    assert _run_with_streams("q\n", out, monkeypatch, patch_sleep=False) == 0
+    assert slept == [menu_mod.STARTUP_BLANK_SECONDS]
+
+
+def test_generate_keeps_relay_menu_on_screen(monkeypatch):
+    """Option 01 leaves the RELAY menu visible while its prompts appear below."""
+    import astral_relay.cli.menu as menu_mod
+
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    out = FakeTTY()
+    seen = {}
+
+    def fake_generate(console, enabled, **kwargs):
+        seen["screen"] = "\n".join(_emulate_screen(out.getvalue()))
+        seen["kwargs"] = kwargs
+        return True
+
+    monkeypatch.setattr(menu_mod, "run_generate", fake_generate)
+    assert _run_with_streams("n\n1\nq\n", out, monkeypatch) == 0
+    # The RELAY menu (and the echoed choice) is still on screen when the
+    # generate prompts begin, instead of being erased beforehand.
+    assert seen["screen"].count("┌── RELAY") == 1
+    # The menu keeps its own prompt block, so the token prompt must not
+    # print a second header/└── >> block.
+    assert seen["kwargs"].get("show_token_header") is False
+
+
+def test_other_choices_erase_menu_before_action(monkeypatch):
+    """Non-generate choices still erase the menu (no accumulation)."""
+    import astral_relay.cli.menu as menu_mod
+
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    out = FakeTTY()
+    seen = {}
+
+    def fake_start(console, enabled):
+        seen["screen"] = "\n".join(_emulate_screen(out.getvalue()))
+        return None
+
+    monkeypatch.setattr(menu_mod, "run_start", fake_start)
+    assert _run_with_streams("n\n2\nq\n", out, monkeypatch) == 0
+    assert seen["screen"].count("┌── RELAY") == 0
 
 
 def test_non_interactive_has_no_screen_sequences(monkeypatch):
@@ -223,7 +284,7 @@ def test_generate_result_has_no_panel(monkeypatch):
     import astral_relay.builder.build as build_mod
     import astral_relay.cli.menu as menu_mod
 
-    monkeypatch.setattr(build_mod, "prompt_build_token", lambda: (_ for _ in ()).throw(ValueError("Empty token rejected.")))
+    monkeypatch.setattr(build_mod, "prompt_build_token", lambda **kwargs: (_ for _ in ()).throw(ValueError("Empty token rejected.")))
     stdin = FakePipe()
     monkeypatch.setattr(sys, "stdin", stdin)
     console = Console(file=FakePipe(), force_terminal=False, no_color=True)
